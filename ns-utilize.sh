@@ -1,14 +1,14 @@
 #!/bin/bash
 #
-# pmapp.sh : Preventive Maintenance Application Workload Check OpenShift
+# ns-utilize.sh : Preventive Maintenance Application Workload Check OpenShift
 # Fokus ke namespace aplikasi (exclude openshift*, kube-*, dan namespace platform)
 # Output tampil di terminal & save sebagai .log, tabel detail juga di-export ke CSV
 # Summary ada di bagian paling bawah
 #
 # Usage:
-#   ./pmapp.sh
-#   ENV_NAME=prod ./pmapp.sh                          # override nama environment
-#   INCLUDE_NS_REGEX='^(bisigap|mapp)-' ./pmapp.sh    # hanya namespace tertentu
+#   ./ns-utilize.sh
+#   ENV_NAME=prod ./ns-utilize.sh                          # override nama environment
+#   INCLUDE_NS_REGEX='^(bisigap|mapp)-' ./ns-utilize.sh    # hanya namespace tertentu
 #
 # Isi check:
 #   1. Inventory namespace  : jumlah pod, workload, HPA, route, PVC, quota per namespace
@@ -29,6 +29,7 @@ POD_THRESHOLD=85         # persen usage pod terhadap limit, di atas nilai ini = 
 LOW_USAGE=10             # persen usage terhadap request, di bawah nilai ini = OVERPROV (info saja)
 QUOTA_THRESHOLD=85       # persen pemakaian ResourceQuota, di atas nilai ini = WARN
 RESTART_THRESHOLD=5      # jumlah restart pod, di atas/sama dengan nilai ini = WARN
+OC_TIMEOUT=300s          # timeout per request oc get, supaya tidak menggantung
 
 # Namespace platform yang di-exclude (regex full name)
 # Namespace dengan label openshift.io/cluster-monitoring=true juga otomatis di-exclude
@@ -64,10 +65,10 @@ if [ -z "$ENV_NAME" ]; then
   [ -z "$ENV_NAME" ] && ENV_NAME="cluster"
 fi
 
-LOG_FILE="${LOG_DIR}/pmapp-${ENV_NAME}-$(date +%Y%m%d-%H%M).log"
+LOG_FILE="${LOG_DIR}/ns-utilize-${ENV_NAME}-$(date +%Y%m%d-%H%M).log"
 if ! touch "$LOG_FILE" 2>/dev/null; then
   echo -e "${YELLOW}Folder ${LOG_DIR} tidak bisa ditulis, log disimpan di /tmp${NC}"
-  LOG_FILE="/tmp/pmapp-${ENV_NAME}-$(date +%Y%m%d-%H%M).log"
+  LOG_FILE="/tmp/ns-utilize-${ENV_NAME}-$(date +%Y%m%d-%H%M).log"
 fi
 CSV_DIR="${LOG_FILE%.log}-csv"
 mkdir -p "$CSV_DIR"
@@ -125,13 +126,44 @@ echo
 echo "Mengambil data dari cluster..."
 
 # Ambil semua object sekali (paralel), analisa offline di python
-RESOURCES="namespaces nodes pods deployments statefulsets daemonsets deploymentconfigs cronjobs jobs replicasets horizontalpodautoscalers services routes persistentvolumeclaims resourcequotas limitranges"
+# replicasets & jobs tidak diambil (paling berat), owner dihitung dari nama pod/label
+# Progress per resource ditampilkan dengan durasi dan ukuran, error disimpan ke .err
+RESOURCES="namespaces nodes pods deployments statefulsets daemonsets deploymentconfigs cronjobs horizontalpodautoscalers services routes persistentvolumeclaims resourcequotas limitranges"
+fetch() {
+  local name="$1"; shift
+  local t0=$SECONDS rc
+  "$@" > "$TMP/$name.out" 2> "$TMP/$name.err"; rc=$?
+  local sz; sz=$(du -h "$TMP/$name.out" 2>/dev/null | cut -f1)
+  if [ $rc -eq 0 ]; then
+    printf "  %-26s ${GREEN}OK${NC}    %4ss  %s\n" "$name" "$((SECONDS - t0))" "$sz"
+  else
+    printf "  %-26s ${YELLOW}GAGAL${NC} %4ss  %s\n" "$name" "$((SECONDS - t0))" "$(head -c 120 "$TMP/$name.err" | tr '\n' ' ')"
+    echo "$name" >> "$TMP/failed.txt"
+  fi
+}
+# PENTING: wait harus pakai PID. "wait" tanpa argumen ikut menunggu proses tee (log) sehingga script menggantung
+FETCH_START=$SECONDS; PIDS=()
 for r in $RESOURCES; do
-  oc get "$r" -A -o json > "$TMP/$r.json" 2>/dev/null &
+  fetch "$r" oc get "$r" -A -o json --request-timeout="$OC_TIMEOUT" & PIDS+=($!)
 done
-oc adm top nodes --no-headers > "$TMP/top_nodes.txt" 2>/dev/null &
-oc adm top pods -A --no-headers > "$TMP/top_pods.txt" 2>/dev/null &
-wait
+fetch top_nodes oc adm top nodes --no-headers & PIDS+=($!)
+fetch top_pods oc adm top pods -A --no-headers & PIDS+=($!)
+wait "${PIDS[@]}"
+for r in $RESOURCES; do mv "$TMP/$r.out" "$TMP/$r.json" 2>/dev/null; done
+mv "$TMP/top_nodes.out" "$TMP/top_nodes.txt" 2>/dev/null
+mv "$TMP/top_pods.out" "$TMP/top_pods.txt" 2>/dev/null
+echo "Selesai ambil data dalam $((SECONDS - FETCH_START)) detik"
+
+# Resource wajib, jika gagal hasil analisa tidak valid
+for r in namespaces nodes pods; do
+  if grep -qx "$r" "$TMP/failed.txt" 2>/dev/null; then
+    echo -e "${RED}Gagal mengambil ${r}, cek akses user (butuh cluster-reader/cluster-admin). Error:${NC}"
+    cat "$TMP/$r.err"
+    exit 1
+  fi
+done
+# deploymentconfigs boleh gagal (capability DeploymentConfig bisa dinonaktifkan di OCP 4.14+)
+FETCH_FAILED=$(grep -vx deploymentconfigs "$TMP/failed.txt" 2>/dev/null | xargs)
 
 ############################ ANALYZER ############################
 cat > "$TMP/analyze.py" <<'PYEOF'
@@ -287,14 +319,6 @@ for p in readlines('top_pods.txt'):
         PU[(p[0], p[1])] = (cpu(p[2]), mem(p[3]))
 HAS_METRICS = bool(PU)
 
-# ---------- owner mapping ----------
-RS, JOB = {}, {}
-for r in load('replicasets'):
-    ref = ctrl(r['metadata'])
-    if ref: RS[(r['metadata']['namespace'], r['metadata']['name'])] = (ref['kind'], ref['name'])
-for j in load('jobs'):
-    ref = ctrl(j['metadata'])
-    if ref: JOB[(j['metadata']['namespace'], j['metadata']['name'])] = (ref['kind'], ref['name'])
 
 # ---------- workload ----------
 WL = {}
@@ -397,13 +421,19 @@ for p in load('pods'):
     else:
         k, n = ref['kind'], ref['name']
         if k == 'ReplicaSet':
-            k, n = RS.get((ns, n), (k, n))
+            # nama RS = <deployment>-<pod-template-hash>
+            h = (md.get('labels') or {}).get('pod-template-hash')
+            if h and n.endswith('-' + h) and (ns, 'Deployment', n[:-len(h) - 1]) in WL:
+                k, n = 'Deployment', n[:-len(h) - 1]
         elif k == 'ReplicationController':
             lab = md.get('labels') or {}
             dc = lab.get('deploymentconfig') or lab.get('openshift.io/deployment-config.name')
             if dc: k, n = 'DeploymentConfig', dc
         elif k == 'Job':
-            k, n = JOB.get((ns, n), (k, n))
+            # nama Job dari CronJob = <cronjob>-<angka jadwal>
+            cj = re.sub(r'-\d+$', '', n)
+            if cj != n and (ns, 'CronJob', cj) in WL:
+                k, n = 'CronJob', cj
         wk = (k, n)
     key = (ns,) + wk
     if key not in WL:
@@ -914,6 +944,7 @@ echo "Environment : ${ENV_NAME}"
 echo "API         : ${API_URL}"
 echo "Version     : ${CLUSTER_VERSION}"
 echo "Date        : $(date '+%Y-%m-%d %H:%M:%S %Z')"
+[ -n "$FETCH_FAILED" ] && echo -e "${YELLOW}Data gagal diambil: ${FETCH_FAILED} (hasil terkait tidak lengkap)${NC}"
 echo
 column -t -s $'\t' < "$TMP/overview.tsv"
 
