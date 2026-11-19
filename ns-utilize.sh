@@ -12,13 +12,15 @@
 #
 # Isi check:
 #   1. Inventory namespace  : jumlah pod, workload, HPA, route, PVC, quota per namespace
-#   2. Workload             : peruntukkan (label/image/route), replica, distribusi node
-#   3. Distribusi pod       : pembagian pod aplikasi per node, workload SPOF (semua replica di 1 node)
+#   2. Workload             : peruntukkan (label/image/route), replica, PDB, anti-affinity, route TLS
+#   3. Distribusi pod & HA  : pembagian pod per node, SPOF (single replica / 1 node), PodDisruptionBudget
 #   4. Utilisasi pod        : usage vs request/limit per namespace, per workload, pod bermasalah
 #   5. Resource config      : request/limit/probe per container
 #   6. Quota & LimitRange
 #   7. PVC aplikasi
-#   8. Utilisasi node       : usage aktual, total request/limit vs allocatable, sisa kapasitas
+#   8. Utilisasi node       : usage aktual, total request/limit vs allocatable, sisa kapasitas, ukuran node
+#   Housekeeping            : pod Completed/Failed/Evicted yang menumpuk
+#   Best practice           : probe, image :latest, route tanpa TLS, PDB
 #
 
 ############################ VARIABLE ############################
@@ -30,11 +32,13 @@ LOW_USAGE=10             # persen usage terhadap request, di bawah nilai ini = O
 QUOTA_THRESHOLD=85       # persen pemakaian ResourceQuota, di atas nilai ini = WARN
 RESTART_THRESHOLD=5      # jumlah restart pod, di atas/sama dengan nilai ini = WARN
 OC_TIMEOUT=300s          # timeout per request oc get, supaya tidak menggantung
+HOUSEKEEP_THRESHOLD=50   # jumlah pod Completed/Failed/Evicted per namespace, di atas nilai ini = WARN
+MAX_PODS_SUPPORTED=500   # batas maxPods per node yang didukung Red Hat
 
 # Namespace platform yang di-exclude (regex full name)
 # Namespace dengan label openshift.io/cluster-monitoring=true juga otomatis di-exclude
 # Tambahkan namespace platform/operator lain sesuai cluster
-PLATFORM_NS_REGEX="${PLATFORM_NS_REGEX:-^(openshift|openshift-.*|kube-.*|default|stackrox|rhacs-operator|open-cluster-management.*|multicluster-engine|hive|cert-manager.*|nvidia-gpu-operator|redhat-ods-.*|knative-.*|istio-system)$}"
+PLATFORM_NS_REGEX="${PLATFORM_NS_REGEX:-^(openshift|openshift-.*|kube-.*|default|assisted-installer|stackrox|rhacs-operator|open-cluster-management.*|multicluster-engine|hive|cert-manager.*|nvidia-gpu-operator|redhat-ods-.*|knative-.*|istio-system)$}"
 INCLUDE_NS_REGEX="${INCLUDE_NS_REGEX:-}"
 
 ############################ SETUP ############################
@@ -75,8 +79,9 @@ mkdir -p "$CSV_DIR"
 exec > >(tee >(sed 's/\x1b\[[0-9;]*m//g' >> "$LOG_FILE")) 2>&1
 
 declare -A RES DET
-INVENTORY_KEYS=("Check App Pods" "Check Workload Replica" "Check Pod Distribution" "Check PVC")
+INVENTORY_KEYS=("Check App Pods" "Check Workload Replica" "Check Pod Distribution" "Check PDB" "Check PVC" "Check Housekeeping")
 CAPACITY_KEYS=("Check Pod Utilization" "Check Resource Limit" "Check Quota" "Check Node Utilization")
+PRACTICE_KEYS=("Check Probe" "Check Image Tag" "Check Route TLS")
 
 set_result() { RES["$1"]="$2"; DET["$1"]="$3"; }
 
@@ -113,6 +118,7 @@ show() {
 
 ############################ PRE ############################
 CLUSTER_VERSION=$(oc get clusterversion version -o jsonpath='{.status.desired.version}')
+APPS_DOMAIN=$(oc get ingresses.config.openshift.io cluster -o jsonpath='{.spec.domain}' 2>/dev/null)
 API_URL=$(oc whoami --show-server)
 
 section "WORKLOAD CHECK : ${ENV_NAME}"
@@ -128,7 +134,7 @@ echo "Mengambil data dari cluster..."
 # Ambil semua object sekali (paralel), analisa offline di python
 # replicasets & jobs tidak diambil (paling berat), owner dihitung dari nama pod/label
 # Progress per resource ditampilkan dengan durasi dan ukuran, error disimpan ke .err
-RESOURCES="namespaces nodes pods deployments statefulsets daemonsets deploymentconfigs cronjobs horizontalpodautoscalers services routes persistentvolumeclaims resourcequotas limitranges"
+RESOURCES="namespaces nodes pods deployments statefulsets daemonsets deploymentconfigs cronjobs horizontalpodautoscalers poddisruptionbudgets services routes persistentvolumeclaims resourcequotas limitranges"
 fetch() {
   local name="$1"; shift
   local t0=$SECONDS rc
@@ -179,6 +185,14 @@ T_POD = float(E.get('POD_THRESHOLD', 85))
 T_LOW = float(E.get('LOW_USAGE', 10))
 T_QUOTA = float(E.get('QUOTA_THRESHOLD', 85))
 T_RST = int(E.get('RESTART_THRESHOLD', 5))
+T_HK = int(E.get('HOUSEKEEP_THRESHOLD', 50))
+T_MAXPODS = int(E.get('MAX_PODS_SUPPORTED', 500))
+APPS_DOMAIN = E.get('APPS_DOMAIN', '')
+from datetime import datetime, timezone
+NOW = datetime.now(timezone.utc).replace(tzinfo=None)
+def age(ts):
+    try: return (NOW - datetime.strptime(ts[:19], '%Y-%m-%dT%H:%M:%S')).days
+    except (TypeError, ValueError): return None
 
 # ---------- helper ----------
 def load(name):
@@ -302,7 +316,7 @@ for n in load('nodes'):
         st += ',SchedDisabled'
     NODES[md['name']] = dict(
         roles=','.join(roles) or '-', status=st,
-        cpu=cpu(al.get('cpu')), mem=mem(al.get('memory')), podcap=al.get('pods', '-'),
+        cpu=cpu(al.get('cpu')), mem=mem(al.get('memory')), podcap=int(mem(al.get('pods')) or 0),
         cr=0, cl=0, mr=0, ml=0, pods=0,
         app_pods=0, app_cr=0, app_mr=0, app_cu=0, app_mu=0, ns=Counter(),
         use_cpu=None, use_mem=None)
@@ -450,7 +464,10 @@ for p in load('pods'):
         pass
     elif base == 'Evicted':
         tags.append('EVICTED'); sev = 'WARN'
-    elif base in FAILS or phase == 'Failed':
+    elif phase == 'Failed':
+        # pod sudah selesai dengan status gagal (sisa job/build), bukan aplikasi yang sedang down
+        tags.append('FAILED_OLD'); sev = 'WARN'
+    elif base in FAILS:
         tags.append(status); sev = 'FAIL'
     elif not ready_ok:
         tags.append('NOT_READY' if status == 'Running' else status); sev = 'WARN'
@@ -466,6 +483,7 @@ for p in load('pods'):
     pod = dict(ns=ns, name=md['name'], node=node, phase=phase, status=status, active=active,
                ready='%d/%d' % (ready, total), ready_ok=ready_ok, restarts=restarts,
                lastterm=','.join(lastterm), wl=key, spec=spec, labels=md.get('labels') or {},
+               age=age(st.get('startTime') or md.get('creationTimestamp')),
                cu=cu, mu=mu, cpl=cpl, mpl=mpl, tags=tags, util=util, sev=sev, **r)
     PODS.append(pod)
     PODS_NS[ns].append(pod)
@@ -485,6 +503,7 @@ for w in WL.values():
     w['nodes'] = Counter(short(p['node']) for p in w['act'] if p['node'])
     # spec representatif: dari pod aktif (sudah termasuk default LimitRange), fallback ke template
     w['rspec'] = w['act'][0]['spec'] if w['act'] else w['spec']
+    w['pdb'] = ''
 
 def purpose(w):
     l = dict(w['tlabels']); l.update(w['labels'])
@@ -507,6 +526,22 @@ def image(spec):
     if not imgs: return ''
     return imgs[0] + (' +%d' % (len(imgs) - 1) if len(imgs) > 1 else '')
 
+HA_KINDS = ('Deployment', 'StatefulSet', 'DeploymentConfig')
+
+def spread(spec):
+    s = []
+    if (spec.get('affinity') or {}).get('podAntiAffinity'): s.append('AA')
+    if spec.get('topologySpreadConstraints'): s.append('TSC')
+    return '+'.join(s)
+
+def latest(spec):
+    out = []
+    for c in spec.get('containers') or []:
+        last = (c.get('image') or '').split('/')[-1]
+        if last.endswith(':latest') or (':' not in last and '@' not in last):
+            out.append(c.get('name'))
+    return out
+
 def wl_tags(w):
     t = []; k = w['kind']
     if k == 'CronJob':
@@ -519,6 +554,12 @@ def wl_tags(w):
         elif r < d: t.append('DEGRADED')
     if k not in ('DaemonSet', 'CronJob', 'Job') and len(w['act']) > 1 and len(w['nodes']) == 1:
         t.append('SAME_NODE')
+    if k in HA_KINDS and w['desired'] == 1:
+        t.append('SINGLE_REPLICA')
+    if k in HA_KINDS and (w['desired'] or 0) > 1 and not spread(w['rspec']):
+        t.append('NO_SPREAD')
+    if latest(w['spec'] or w['rspec']):
+        t.append('LATEST_TAG')
     return t
 
 WLS = sorted(WL.values(), key=lambda w: (w['ns'], w['kind'], w['name']))
@@ -538,22 +579,55 @@ for s in load('services'):
                 wls.add(p['wl'][2])
     SVC[(ns, name)] = wls
 
-ROUTE_ROWS = []; ROUTE_CNT = Counter()
+ROUTE_ROWS = []; ROUTE_CNT = Counter(); route_notls = []; route_http = []; route_dom = []
 for r in load('routes'):
     if not isapp(r): continue
-    ns = r['metadata']['namespace']; sp = r.get('spec') or {}
+    ns = r['metadata']['namespace']; sp = r.get('spec') or {}; rname = r['metadata']['name']
     to = (sp.get('to') or {}).get('name', '')
+    tls = sp.get('tls') or {}; host = sp.get('host') or ''
+    t = []
+    if not tls:
+        t.append('NO_TLS'); route_notls.append('%s/%s' % (ns, rname))
+    elif tls.get('insecureEdgeTerminationPolicy') == 'Allow':
+        t.append('HTTP_ALLOWED'); route_http.append('%s/%s' % (ns, rname))
+    if APPS_DOMAIN and '.apps.' in host and not host.endswith('.' + APPS_DOMAIN):
+        t.append('OTHER_CLUSTER_DOMAIN'); route_dom.append(host)
     ROUTE_CNT[ns] += 1
-    ROUTE_ROWS.append([ns, r['metadata']['name'], sp.get('host'), sp.get('path') or '/', to,
-                       (sp.get('tls') or {}).get('termination', 'none'), ','.join(sorted(SVC.get((ns, to), [])))])
+    ROUTE_ROWS.append([ns, rname, host, sp.get('path') or '/', to, tls.get('termination', 'none'),
+                       tls.get('insecureEdgeTerminationPolicy', '-') if tls else '-',
+                       ','.join(sorted(SVC.get((ns, to), []))), ','.join(t) or 'OK'])
+
+# ---------- pdb ----------
+PDB_ROWS = []; pdb_block = []
+for b in load('poddisruptionbudgets'):
+    if not isapp(b): continue
+    ns, name = b['metadata']['namespace'], b['metadata']['name']
+    sp = b.get('spec') or {}; st = b.get('status') or {}
+    sel = (sp.get('selector') or {}).get('matchLabels') or {}
+    wls = set()
+    if sel:
+        for p in PODS_NS[ns]:
+            if p['active'] and p['wl'] and all(p['labels'].get(k) == v for k, v in sel.items()):
+                wls.add(p['wl'])
+    exp, allowed = st.get('expectedPods', 0), st.get('disruptionsAllowed', 0)
+    tag = 'OK'
+    if exp > 0 and allowed == 0:
+        tag = 'BLOCK_DRAIN'; pdb_block.append('%s/%s' % (ns, name))
+    elif exp == 0:
+        tag = 'NO_MATCH_POD'
+    for k in wls:
+        WL[k]['pdb'] = name + ('(BLOCK)' if tag == 'BLOCK_DRAIN' else '')
+    PDB_ROWS.append([ns, name, sp.get('minAvailable', '-'), sp.get('maxUnavailable', '-'), exp,
+                     st.get('currentHealthy', 0), allowed, ','.join(sorted(k[2] for k in wls)), tag])
 
 # ---------- pvc ----------
-PVC_USERS = defaultdict(set)
+PVC_USERS = defaultdict(set); PVC_DONE = Counter()
 for p in PODS:
-    if not p['active']: continue
     for v in p['spec'].get('volumes') or []:
         c = (v.get('persistentVolumeClaim') or {}).get('claimName')
-        if c: PVC_USERS[(p['ns'], c)].add(p['wl'][2] if p['wl'] else p['name'])
+        if not c: continue
+        if p['active']: PVC_USERS[(p['ns'], c)].add(p['wl'][2] if p['wl'] else p['name'])
+        else: PVC_DONE[(p['ns'], c)] += 1
 
 PVC_ROWS = []; PVC_CNT = Counter(); PVC_SIZE = defaultdict(float); pvc_bad = []; pvc_unused = 0
 for c in load('persistentvolumeclaims'):
@@ -566,6 +640,8 @@ for c in load('persistentvolumeclaims'):
     tag = 'OK'
     if phase != 'Bound':
         tag = 'NOT_BOUND'; pvc_bad.append('%s/%s' % (ns, name))
+    elif not users and PVC_DONE[(ns, name)]:
+        tag = 'USED_BY_COMPLETED'; users = ['%d pod completed' % PVC_DONE[(ns, name)]]
     elif not users:
         tag = 'UNUSED'; pvc_unused += 1
     PVC_CNT[ns] += 1; PVC_SIZE[ns] += mem(size) or 0
@@ -623,6 +699,25 @@ if rows:
 table('namespace', ['NAMESPACE', 'PODS', 'RUNNING', 'COMPLETED', 'NOT_OK', 'DEPLOY', 'STS', 'DS', 'DC', 'CRONJOB', 'OTHER',
                     'HPA', 'ROUTE', 'PVC', 'QUOTA', 'LIMITRANGE', 'REQUESTER', 'CREATED', 'DESCRIPTION'], rows)
 
+rows = []; hk_warn = []
+for ns in sorted(APP):
+    done = [p for p in PODS_NS[ns] if not p['active']]
+    if not done: continue
+    c = Counter('EVICTED' if 'EVICTED' in p['tags'] else p['phase'] for p in done)
+    ages = [p['age'] for p in done if p['age'] is not None]
+    tag = 'OK'
+    if len(done) > T_HK:
+        tag = 'CLEANUP'; hk_warn.append('%s(%d pod)' % (ns, len(done)))
+    rows.append([ns, c['Succeeded'], c['Failed'], c['EVICTED'], len(done),
+                 '%d hari' % max(ages) if ages else '-', tag])
+table('housekeeping', ['NAMESPACE', 'COMPLETED', 'FAILED', 'EVICTED', 'TOTAL', 'TERTUA', 'RESULT'], rows)
+if not APP:
+    result('Check Housekeeping', 'SKIP', 'Tidak ada namespace aplikasi')
+elif hk_warn:
+    result('Check Housekeeping', 'WARN', 'Pod selesai > %d per namespace: %s' % (T_HK, lst(hk_warn, 3)))
+else:
+    result('Check Housekeeping', 'PASS', '%d pod Completed/Failed, di bawah %d per namespace' % (sum(r[4] for r in rows), T_HK))
+
 # ============================================================
 # 2. WORKLOAD & PERUNTUKKAN
 # ============================================================
@@ -630,10 +725,42 @@ rows = []
 for w in WLS:
     rd = '-' if w['kind'] == 'CronJob' else '%s/%s' % (w['ready'], w['desired'])
     dist = ','.join('%s:%d' % kv for kv in sorted(w['nodes'].items()))
-    rows.append([w['ns'], w['kind'], w['name'], rd, w['hpa'], purpose(w), image(w['spec'] or w['rspec']),
-                 dist, ','.join(w['tags']) or 'OK', w['extra']])
-table('workload', ['NAMESPACE', 'KIND', 'NAME', 'READY', 'HPA', 'APP_LABEL', 'IMAGE', 'NODE_DISTRIBUTION', 'RESULT', 'NOTE'], rows)
-table('route', ['NAMESPACE', 'ROUTE', 'HOST', 'PATH', 'SERVICE', 'TLS', 'WORKLOAD'], sorted(ROUTE_ROWS))
+    ha = w['kind'] in HA_KINDS
+    rows.append([w['ns'], w['kind'], w['name'], rd, w['hpa'], w['pdb'] if ha else '', spread(w['rspec']) if ha else '',
+                 purpose(w), image(w['spec'] or w['rspec']), dist, ','.join(w['tags']) or 'OK', w['extra']])
+table('workload', ['NAMESPACE', 'KIND', 'NAME', 'READY', 'HPA', 'PDB', 'SPREAD', 'APP_LABEL', 'IMAGE', 'NODE_DISTRIBUTION', 'RESULT', 'NOTE'], rows)
+table('route', ['NAMESPACE', 'ROUTE', 'HOST', 'PATH', 'SERVICE', 'TLS', 'INSECURE_POLICY', 'WORKLOAD', 'RESULT'], sorted(ROUTE_ROWS))
+table('pdb', ['NAMESPACE', 'PDB', 'MIN_AVAILABLE', 'MAX_UNAVAILABLE', 'EXPECTED', 'HEALTHY', 'ALLOWED_DISRUPTION', 'WORKLOAD', 'RESULT'], sorted(PDB_ROWS))
+
+no_pdb = ['%s/%s' % (w['ns'], w['name']) for w in WLS if w['kind'] in HA_KINDS and (w['desired'] or 0) > 1 and not w['pdb']]
+if not APP:
+    result('Check PDB', 'SKIP', 'Tidak ada namespace aplikasi')
+elif pdb_block or no_pdb:
+    d = []
+    if pdb_block: d.append('%d PDB blok drain (allowed 0): %s' % (len(pdb_block), lst(pdb_block, 3)))
+    if no_pdb: d.append('%d workload multi replica tanpa PDB' % len(no_pdb))
+    result('Check PDB', 'WARN', '; '.join(d))
+else:
+    result('Check PDB', 'PASS', '%d PDB, tidak ada yang blok drain' % len(PDB_ROWS))
+
+# best practice: image tag & route tls
+lt = ['%s/%s' % (w['ns'], w['name']) for w in WLS if 'LATEST_TAG' in w['tags']]
+if not APP:
+    result('Check Image Tag', 'SKIP', 'Tidak ada namespace aplikasi')
+elif lt:
+    result('Check Image Tag', 'WARN', '%d workload pakai :latest/tanpa tag: %s' % (len(lt), lst(lt, 3)))
+else:
+    result('Check Image Tag', 'PASS', 'Semua image pakai tag versi/digest')
+if not APP:
+    result('Check Route TLS', 'SKIP', 'Tidak ada namespace aplikasi')
+elif route_notls or route_http or route_dom:
+    d = []
+    if route_notls: d.append('%d route tanpa TLS: %s' % (len(route_notls), lst(route_notls, 3)))
+    if route_http: d.append('%d route izinkan HTTP' % len(route_http))
+    if route_dom: d.append('%d host domain cluster lain: %s' % (len(route_dom), lst(route_dom, 2)))
+    result('Check Route TLS', 'WARN', '; '.join(d))
+else:
+    result('Check Route TLS', 'PASS', '%d route pakai TLS' % len(ROUTE_ROWS))
 
 wl_down = ['%s/%s' % (w['ns'], w['name']) for w in WLS if 'DOWN' in w['tags']]
 wl_deg = ['%s/%s' % (w['ns'], w['name']) for w in WLS if 'DEGRADED' in w['tags']]
@@ -655,28 +782,33 @@ rows = []
 for name in sorted(NODES):
     n = NODES[name]
     top = ', '.join('%s(%d)' % kv for kv in n['ns'].most_common(3))
-    rows.append([short(name), n['roles'], n['status'], n['app_pods'], n['pods'], n['podcap'],
+    rows.append([short(name), n['roles'], n['status'], n['app_pods'], n['pods'], n['podcap'] or '-',
                  fc(n['app_cr']), fm(n['app_mr']), fc(n['app_cu']) if HAS_METRICS else '-', fm(n['app_mu']) if HAS_METRICS else '-', top])
 table('distribution', ['NODE', 'ROLE', 'STATUS', 'APP_PODS', 'ALL_PODS', 'POD_CAP', 'APP_CPU_REQ', 'APP_MEM_REQ',
                        'APP_CPU_USE', 'APP_MEM_USE', 'TOP_NAMESPACE'], rows)
 
 rows = []
 for w in WLS:
-    iss = [t for t in w['tags'] if t in ('SAME_NODE', 'BARE_POD')]
+    iss = [t for t in w['tags'] if t in ('SAME_NODE', 'BARE_POD', 'SINGLE_REPLICA', 'NO_SPREAD')]
     if iss:
         rows.append([w['ns'], w['kind'], w['name'], len(w['act']), ','.join(sorted(w['nodes'])), ','.join(iss)])
 table('distribution_issue', ['NAMESPACE', 'KIND', 'NAME', 'PODS', 'NODE', 'ISSUE'], rows)
 same = [r[0] + '/' + r[2] for r in rows if 'SAME_NODE' in r[5]]
 bare = [r[0] + '/' + r[2] for r in rows if 'BARE_POD' in r[5]]
+single = [r[0] + '/' + r[2] for r in rows if 'SINGLE_REPLICA' in r[5]]
+nospread = [r[0] + '/' + r[2] for r in rows if 'NO_SPREAD' in r[5]]
 if not APP:
     result('Check Pod Distribution', 'SKIP', 'Tidak ada namespace aplikasi')
-elif same or bare:
+elif same or bare or single:
     d = []
     if same: d.append('%d workload semua replica di 1 node: %s' % (len(same), lst(same, 3)))
+    if single: d.append('%d workload single replica: %s' % (len(single), lst(single, 3)))
     if bare: d.append('%d bare pod tanpa controller' % len(bare))
+    if nospread: d.append('%d multi replica tanpa anti-affinity/TSC (info)' % len(nospread))
     result('Check Pod Distribution', 'WARN', '; '.join(d))
 else:
-    result('Check Pod Distribution', 'PASS', 'Replica tersebar di lebih dari 1 node')
+    result('Check Pod Distribution', 'PASS', 'Replica tersebar di lebih dari 1 node' +
+           (', %d tanpa anti-affinity/TSC (info)' % len(nospread) if nospread else ''))
 
 # ============================================================
 # 4. UTILISASI POD
@@ -710,10 +842,11 @@ for w in WLS:
     if mcpl is not None and mcpl > T_POD: t.append('HIGH_CPU')
     if mmpl is not None and mmpl > T_POD: t.append('HIGH_MEM')
     pcr, pmr = pct(cu, cr), pct(mu, mr)
-    if pcr is not None and pmr is not None and pcr < T_LOW and pmr < T_LOW: t.append('OVERPROV')
+    if pcr is not None and pcr < T_LOW: t.append('OVERPROV_CPU')
+    if pmr is not None and pmr < T_LOW: t.append('OVERPROV_MEM')
     if rst >= T_RST: t.append('RESTART')
     if 'HIGH_CPU' in t or 'HIGH_MEM' in t: high.append('%s/%s' % (w['ns'], w['name']))
-    if 'OVERPROV' in t: over.append(w['name'])
+    if 'OVERPROV_CPU' in t or 'OVERPROV_MEM' in t: over.append(w['name'])
     rows.append([w['ns'], w['kind'], w['name'], len(act), fc(cu), fc(cr), fc(cl), fp(pcr), fp(mcpl),
                  fm(mu), fm(mr), fm(ml), fp(pmr), fp(mmpl), rst, ','.join(t) or 'OK'])
 table('workload_utilization', ['NAMESPACE', 'KIND', 'NAME', 'PODS', 'CPU_USE', 'CPU_REQ', 'CPU_LIM', 'CPU%REQ', 'MAX_CPU%LIM',
@@ -741,9 +874,9 @@ n_act = sum(1 for p in PODS if p['active'])
 if not APP:
     result('Check App Pods', 'SKIP', 'Tidak ada namespace aplikasi')
 elif pod_fail:
-    result('Check App Pods', 'FAIL', '%d pod error: %s' % (len(pod_fail), lst(pod_fail, 3)) + ('; %d pod warning' % len(pod_warn) if pod_warn else ''))
+    result('Check App Pods', 'FAIL', '%d pod aktif error: %s' % (len(pod_fail), lst(pod_fail, 3)) + ('; %d pod warning' % len(pod_warn) if pod_warn else ''))
 elif pod_warn:
-    result('Check App Pods', 'WARN', '%d pod not ready/restart/evicted: %s' % (len(pod_warn), lst(pod_warn, 3)))
+    result('Check App Pods', 'WARN', '%d pod not ready/restart/evicted/failed lama: %s' % (len(pod_warn), lst(pod_warn, 3)))
 else:
     result('Check App Pods', 'PASS', '%d pod aktif Running dan Ready' % n_act)
 
@@ -759,7 +892,7 @@ else:
 # ============================================================
 # 5. RESOURCE CONFIG PER CONTAINER
 # ============================================================
-rows = []; noreq = 0; nolim = 0; ctot = 0
+rows = []; noreq = 0; nolim = 0; ctot = 0; nordy = 0; noliv = 0; ptot = 0
 for w in WLS:
     rep = w['desired'] if w['desired'] is not None else '-'
     for c in w['rspec'].get('containers') or []:
@@ -773,6 +906,10 @@ for w in WLS:
         if cr is None or mr is None: noreq += 1
         if cl is None or ml is None: nolim += 1
         probe = ''.join(x for x, k in (('R', 'readinessProbe'), ('L', 'livenessProbe'), ('S', 'startupProbe')) if c.get(k)) or '-'
+        if w['kind'] not in ('CronJob', 'Job'):
+            ptot += 1
+            if not c.get('readinessProbe'): nordy += 1; t.append('NO_READINESS')
+            if not c.get('livenessProbe'): noliv += 1; t.append('NO_LIVENESS')
         rows.append([w['ns'], w['kind'], w['name'], c.get('name'), rep, fc(cr), fc(cl), fm(mr), fm(ml), probe, ','.join(t) or 'OK'])
 table('resource_config', ['NAMESPACE', 'KIND', 'NAME', 'CONTAINER', 'REPLICAS', 'CPU_REQ', 'CPU_LIM', 'MEM_REQ', 'MEM_LIM', 'PROBE', 'RESULT'], rows)
 if not APP:
@@ -781,6 +918,12 @@ elif noreq or nolim:
     result('Check Resource Limit', 'WARN', 'Dari %d container: %d tanpa request, %d tanpa limit' % (ctot, noreq, nolim))
 else:
     result('Check Resource Limit', 'PASS', '%d container punya request dan limit' % ctot)
+if not APP:
+    result('Check Probe', 'SKIP', 'Tidak ada namespace aplikasi')
+elif nordy or noliv:
+    result('Check Probe', 'WARN', 'Dari %d container: %d tanpa readiness, %d tanpa liveness' % (ptot, nordy, noliv))
+else:
+    result('Check Probe', 'PASS', '%d container punya readiness dan liveness' % ptot)
 
 # ============================================================
 # 6. QUOTA & LIMITRANGE
@@ -794,7 +937,8 @@ elif quota_warn:
 elif QUOTA_NS:
     result('Check Quota', 'PASS', '%d/%d namespace pakai quota, semua < %d%%' % (len(QUOTA_NS), len(APP), T_QUOTA))
 else:
-    result('Check Quota', 'PASS', 'Tidak ada ResourceQuota di namespace aplikasi (info)')
+    result('Check Quota', 'WARN', 'Tidak ada ResourceQuota/LimitRange, namespace bisa pakai resource tanpa batas' if not LR_NS
+           else 'Tidak ada ResourceQuota di namespace aplikasi (info)')
 
 # ============================================================
 # 7. PVC
@@ -805,13 +949,16 @@ if not APP:
 elif pvc_bad:
     result('Check PVC', 'WARN', '%d PVC tidak Bound: %s' % (len(pvc_bad), lst(pvc_bad, 3)))
 else:
-    result('Check PVC', 'PASS', '%d PVC Bound' % len(PVC_ROWS) + (', %d tidak dipakai pod (info)' % pvc_unused if pvc_unused else ''))
+    result('Check PVC', 'PASS', '%d PVC Bound' % len(PVC_ROWS) + (', %d tidak dipakai pod manapun (info)' % pvc_unused if pvc_unused else ''))
 
 # ============================================================
 # 8. UTILISASI NODE
 # ============================================================
-rows = []; node_warn = []; node_fail = []
+rows = []; node_warn = []; node_fail = []; node_info = []; maxpods = Counter()
 ROLE = defaultdict(lambda: defaultdict(float))
+ROLE_MAXMEM = defaultdict(float)
+for n in NODES.values():
+    ROLE_MAXMEM[n['roles']] = max(ROLE_MAXMEM[n['roles']], n['mem'] or 0)
 for name in sorted(NODES):
     n = NODES[name]
     cu_p, mu_p = pct(n['use_cpu'], n['cpu']), pct(n['use_mem'], n['mem'])
@@ -824,9 +971,18 @@ for name in sorted(NODES):
     if mr_p is not None and mr_p > T_NODE: t.append('HIGH_MEM_REQ')
     if 'NOT_READY' in t: node_fail.append(short(name))
     elif t: node_warn.append('%s(%s)' % (short(name), ','.join(t)))
+    if n['podcap'] > T_MAXPODS:
+        t.append('MAXPODS_%d' % n['podcap']); maxpods[n['podcap']] += 1
+    # info, tidak dihitung WARN
+    info = []
+    ml_p = pct(n['ml'], n['mem'])
+    if ml_p is not None and ml_p > 100: info.append('MEM_LIM_OVERCOMMIT')
+    if n['mem'] and n['mem'] < 0.8 * ROLE_MAXMEM[n['roles']]: info.append('SMALLER_THAN_PEER')
+    if 'SMALLER_THAN_PEER' in info: node_info.append('%s(%s vs %s)' % (short(name), fm(n['mem']), fm(ROLE_MAXMEM[n['roles']])))
+    t += info
     rows.append([short(name), n['roles'], n['status'], fc(n['cpu']), fc(n['use_cpu']), fp(cu_p), fp(cr_p), fp(pct(n['cl'], n['cpu'])),
                  fm(n['mem']), fm(n['use_mem']), fp(mu_p), fp(mr_p), fp(pct(n['ml'], n['mem'])),
-                 '%d/%s' % (n['pods'], n['podcap']), ','.join(t) or 'OK'])
+                 '%d/%s' % (n['pods'], n['podcap'] or '-'), ','.join(t) or 'OK'])
     g = ROLE[n['roles']]
     g['n'] += 1
     for k in ('cpu', 'mem', 'cr', 'mr', 'app_cr', 'app_mr'): g[k] += n[k] or 0
@@ -847,8 +1003,12 @@ table('role_capacity', ['ROLE', 'NODES', 'CPU_ALLOC', 'CPU_USE%', 'CPU_REQ%', 'C
 
 if node_fail:
     result('Check Node Utilization', 'FAIL', 'NotReady: %s' % lst(node_fail))
-elif node_warn:
-    result('Check Node Utilization', 'WARN', 'Di atas %d%%: %s' % (T_NODE, lst(node_warn, 3)))
+elif node_warn or maxpods:
+    d = []
+    if node_warn: d.append('Di atas %d%%: %s' % (T_NODE, lst(node_warn, 3)))
+    if maxpods: d.append('maxPods %s di %d node (supported %d)' % ('/'.join(str(k) for k in maxpods), sum(maxpods.values()), T_MAXPODS))
+    if node_info: d.append('memory lebih kecil dari node se-role: %s' % lst(node_info, 3))
+    result('Check Node Utilization', 'WARN', '; '.join(d))
 elif not any(n['use_cpu'] is not None for n in NODES.values()):
     result('Check Node Utilization', 'WARN', 'Metrics node tidak tersedia, hanya request/limit')
 else:
@@ -871,7 +1031,7 @@ with open(os.path.join(D, 'results.tsv'), 'w') as f:
         f.write('%s\t%s\t%s\n' % (k, s, d))
 PYEOF
 
-export PLATFORM_NS_REGEX INCLUDE_NS_REGEX RES_THRESHOLD POD_THRESHOLD LOW_USAGE QUOTA_THRESHOLD RESTART_THRESHOLD
+export PLATFORM_NS_REGEX INCLUDE_NS_REGEX RES_THRESHOLD POD_THRESHOLD LOW_USAGE QUOTA_THRESHOLD RESTART_THRESHOLD HOUSEKEEP_THRESHOLD MAX_PODS_SUPPORTED APPS_DOMAIN
 if ! "$PY" "$TMP/analyze.py" "$TMP" "$CSV_DIR"; then
   echo -e "${RED}Analisa data gagal, cek error python di atas.${NC}"
   exit 1
@@ -886,28 +1046,34 @@ section "1. INVENTORY NAMESPACE APLIKASI (jumlah pod & workload)"
 echo "NOT_OK = pod aktif yang belum Running/Ready, OTHER = owner lain (Job, operator CR, VM, dll)"
 echo
 show namespace "Tidak ada namespace aplikasi (cek PLATFORM_NS_REGEX / INCLUDE_NS_REGEX)"
+sub "Housekeeping pod Completed/Failed/Evicted (threshold ${HOUSEKEEP_THRESHOLD} per namespace)"
+show housekeeping "Tidak ada"
 
 ############################ 2. WORKLOAD ############################
 section "2. WORKLOAD & PERUNTUKKAN"
 echo "APP_LABEL dari label part-of/component/app, NODE_DISTRIBUTION = node:jumlah_pod"
-echo "RESULT: DOWN = 0 ready, DEGRADED = ready < desired, SAME_NODE = semua replica di 1 node, BARE_POD = pod tanpa controller"
+echo "PDB = nama PDB yang meng-cover workload, SPREAD: AA = podAntiAffinity, TSC = topologySpreadConstraints"
+echo "RESULT: DOWN = 0 ready, DEGRADED = ready < desired, SAME_NODE = semua replica di 1 node, BARE_POD = pod tanpa controller,"
+echo "        SINGLE_REPLICA = hanya 1 replica (SPOF), NO_SPREAD = multi replica tanpa aturan sebaran, LATEST_TAG = image :latest/tanpa tag"
 echo
 show workload
-sub "Route aplikasi (endpoint yang diekspos)"
+sub "Route aplikasi (NO_TLS = HTTP plain, HTTP_ALLOWED = edge izinkan HTTP, OTHER_CLUSTER_DOMAIN = host *.apps cluster lain)"
 show route "Tidak ada route"
 
 ############################ 3. DISTRIBUSI POD ############################
-section "3. DISTRIBUSI POD APLIKASI PER NODE"
+section "3. DISTRIBUSI POD APLIKASI PER NODE & HIGH AVAILABILITY"
 show distribution
 sub "Workload dengan risiko distribusi (SPOF)"
 show distribution_issue "Tidak ada"
+sub "PodDisruptionBudget (BLOCK_DRAIN = allowed disruption 0, menghambat drain saat upgrade/MCP rollout)"
+show pdb "Tidak ada PDB di namespace aplikasi"
 
 ############################ 4. UTILISASI POD ############################
 section "4. UTILISASI POD (threshold ${POD_THRESHOLD}% dari limit)"
 echo "Catatan: usage dari oc adm top (snapshot saat ini), capture juga Grafana > Kubernetes / Compute Resources / Namespace (Workloads), last 30 days"
 sub "Per namespace"
 show ns_utilization
-sub "Per workload (OVERPROV = usage < ${LOW_USAGE}% dari request, info saja)"
+sub "Per workload (OVERPROV_CPU/MEM = usage < ${LOW_USAGE}% dari request, validasi dengan Grafana sebelum right-sizing)"
 show workload_utilization
 sub "Pod bermasalah (status, restart >= ${RESTART_THRESHOLD}, OOMKilled, usage > ${POD_THRESHOLD}% limit)"
 show pod_issue "Tidak ada"
@@ -933,6 +1099,7 @@ show pvc "Tidak ada PVC"
 ############################ 8. UTILISASI NODE ############################
 section "8. UTILISASI NODE (threshold ${RES_THRESHOLD}%)"
 echo "USE = usage aktual (oc adm top), REQ/LIM = total request/limit semua pod di node vs allocatable"
+echo "MAXPODS_x = maxPods di atas ${MAX_PODS_SUPPORTED} (batas supported), MEM_LIM_OVERCOMMIT dan SMALLER_THAN_PEER = info"
 echo
 show node_utilization
 sub "Kapasitas per role (FREE_REQ = sisa allocatable yang belum di-request)"
@@ -960,9 +1127,12 @@ print_rows "${INVENTORY_KEYS[@]}"
 echo
 echo -e "${BOLD}CAPACITY & RESOURCE${NC}"
 print_rows "${CAPACITY_KEYS[@]}"
+echo
+echo -e "${BOLD}BEST PRACTICE${NC}"
+print_rows "${PRACTICE_KEYS[@]}"
 
 n_fail=0; n_warn=0; n_pass=0
-for k in "${INVENTORY_KEYS[@]}" "${CAPACITY_KEYS[@]}"; do
+for k in "${INVENTORY_KEYS[@]}" "${CAPACITY_KEYS[@]}" "${PRACTICE_KEYS[@]}"; do
   case "${RES[$k]}" in FAIL) ((n_fail++));; WARN) ((n_warn++));; PASS) ((n_pass++));; esac
 done
 
