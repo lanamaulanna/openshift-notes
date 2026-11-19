@@ -38,7 +38,7 @@ ODF_THRESHOLD=75         # persen usage raw Ceph / pool ODF, di atas nilai ini =
 # Namespace platform yang di-exclude (regex full name)
 # Namespace dengan label openshift.io/cluster-monitoring=true juga otomatis di-exclude
 # Tambahkan namespace platform/operator lain sesuai cluster
-PLATFORM_NS_REGEX="${PLATFORM_NS_REGEX:-^(openshift|openshift-.*|kube-.*|default|assisted-installer|stackrox|rhacs-operator|open-cluster-management.*|multicluster-engine|hive|cert-manager.*|nvidia-gpu-operator|redhat-ods-.*|knative-.*|istio-system)$}"
+PLATFORM_NS_REGEX="${PLATFORM_NS_REGEX:-^(openshift|openshift-.*|kube-.*|default|assisted-installer|stackrox|rhacs-operator|open-cluster-management.*|multicluster-engine|hive|cert-manager.*|nvidia-gpu-operator|redhat-ods-.*|knative-.*|istio-system|example)$}"
 INCLUDE_NS_REGEX="${INCLUDE_NS_REGEX:-}"
 
 ############################ SETUP ############################
