@@ -1,5 +1,6 @@
 oc -n default create secret generic filebrowser-admin \
-  --from-literal=username='adminocp' --from-literal=password='P@ssw0rd'
+  --from-literal=username='adminocp' --from-literal=password='P@ssw0rd' \
+  --dry-run=client -o yaml | oc apply -n default -f -
 
 cat <<'EOF' | oc apply -n default -f -
 apiVersion: apps/v1
@@ -25,9 +26,9 @@ spec:
         args:
         - |
           DB=/database/fb.db
-          filebrowser config init -d $DB --minimumPasswordLength 8 2>/dev/null || filebrowser config init -d $DB
-          filebrowser users add "$FB_USER" "$FB_PASS" --perm.admin -d $DB &&
-          exec filebrowser -d $DB -r /srv -a 0.0.0.0 -p 8080
+          rm -f $DB
+          HASH=$(filebrowser hash "$FB_PASS") &&
+          exec filebrowser -d $DB -r /srv -a 0.0.0.0 -p 8080 --username "$FB_USER" --password "$HASH"
         env:
         - name: FB_USER
           valueFrom:
@@ -87,3 +88,4 @@ spec:
 EOF
 
 oc -n default rollout status deploy/filebrowser
+oc -n default logs deploy/filebrowser | tail -3
