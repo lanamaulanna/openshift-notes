@@ -17,7 +17,7 @@
 #   4. Utilisasi pod        : usage vs request/limit per namespace, per workload, pod bermasalah
 #   5. Resource config      : request/limit/probe per container
 #   6. Quota & LimitRange
-#   7. PVC aplikasi
+#   7. PVC aplikasi         : status, kapasitas, usage aktual (Thanos), growth 7 hari, estimasi penuh
 #   8. Utilisasi node       : usage aktual, total request/limit vs allocatable, sisa kapasitas, ukuran node
 #   Housekeeping            : pod Completed/Failed/Evicted yang menumpuk
 #   Best practice           : probe, image :latest, route tanpa TLS, PDB
@@ -33,7 +33,8 @@ QUOTA_THRESHOLD=85       # persen pemakaian ResourceQuota, di atas nilai ini = W
 RESTART_THRESHOLD=5      # jumlah restart pod, di atas/sama dengan nilai ini = WARN
 OC_TIMEOUT=300s          # timeout per request oc get, supaya tidak menggantung
 HOUSEKEEP_THRESHOLD=50   # jumlah pod Completed/Failed/Evicted per namespace, di atas nilai ini = WARN
-MAX_PODS_SUPPORTED=500   # batas maxPods per node yang didukung Red Hat
+MAX_PODS_WARN=2000       # maxPods node di atas nilai ini = WARN (sesuaikan desain cluster, contoh hostPrefix /20 = 2000)
+PVC_THRESHOLD=85         # persen usage PVC, di atas nilai ini = WARN
 
 # Namespace platform yang di-exclude (regex full name)
 # Namespace dengan label openshift.io/cluster-monitoring=true juga otomatis di-exclude
@@ -69,10 +70,10 @@ if [ -z "$ENV_NAME" ]; then
   [ -z "$ENV_NAME" ] && ENV_NAME="cluster"
 fi
 
-LOG_FILE="${LOG_DIR}/ns-utilize-${ENV_NAME}-$(date +%Y%m%d-%H%M).log"
+LOG_FILE="${LOG_DIR}/report-${ENV_NAME}-$(date +%Y%m%d-%H%M).log"
 if ! touch "$LOG_FILE" 2>/dev/null; then
   echo -e "${YELLOW}Folder ${LOG_DIR} tidak bisa ditulis, log disimpan di /tmp${NC}"
-  LOG_FILE="/tmp/ns-utilize-${ENV_NAME}-$(date +%Y%m%d-%H%M).log"
+  LOG_FILE="/tmp/report-${ENV_NAME}-$(date +%Y%m%d-%H%M).log"
 fi
 CSV_DIR="${LOG_FILE%.log}-csv"
 mkdir -p "$CSV_DIR"
@@ -147,6 +148,22 @@ fetch() {
     echo "$name" >> "$TMP/failed.txt"
   fi
 }
+# Usage PVC dari Thanos Querier (kubelet_volume_stats), dipakai untuk sizing
+THANOS_HOST=$(oc get route thanos-querier -n openshift-monitoring -o jsonpath='{.spec.host}' 2>/dev/null)
+PROM_TOKEN=$(oc create token prometheus-k8s -n openshift-monitoring 2>/dev/null || oc whoami -t 2>/dev/null)
+prom_query() {
+  [ -z "$THANOS_HOST" ] && { echo "route thanos-querier tidak ditemukan" >&2; return 1; }
+  [ -z "$PROM_TOKEN" ] && { echo "token tidak tersedia (login pakai token atau butuh akses create token)" >&2; return 1; }
+  local out
+  out=$(curl -sk --max-time 60 --noproxy "$THANOS_HOST" -H "Authorization: Bearer $PROM_TOKEN" \
+        "https://${THANOS_HOST}/api/v1/query" --data-urlencode "query=$1")
+  if ! echo "$out" | grep -q '"status":"success"'; then
+    echo "${out:-tidak ada respon dari $THANOS_HOST}" | head -c 200 >&2; return 1
+  fi
+  echo "$out"
+}
+PVC_BY='max by (namespace, persistentvolumeclaim)'
+
 # PENTING: wait harus pakai PID. "wait" tanpa argumen ikut menunggu proses tee (log) sehingga script menggantung
 FETCH_START=$SECONDS; PIDS=()
 for r in $RESOURCES; do
@@ -154,10 +171,14 @@ for r in $RESOURCES; do
 done
 fetch top_nodes oc adm top nodes --no-headers & PIDS+=($!)
 fetch top_pods oc adm top pods -A --no-headers & PIDS+=($!)
+fetch pvc_used prom_query "$PVC_BY (kubelet_volume_stats_used_bytes)" & PIDS+=($!)
+fetch pvc_cap prom_query "$PVC_BY (kubelet_volume_stats_capacity_bytes)" & PIDS+=($!)
+fetch pvc_used_7d prom_query "$PVC_BY (kubelet_volume_stats_used_bytes offset 7d)" & PIDS+=($!)
 wait "${PIDS[@]}"
 for r in $RESOURCES; do mv "$TMP/$r.out" "$TMP/$r.json" 2>/dev/null; done
 mv "$TMP/top_nodes.out" "$TMP/top_nodes.txt" 2>/dev/null
 mv "$TMP/top_pods.out" "$TMP/top_pods.txt" 2>/dev/null
+for r in pvc_used pvc_cap pvc_used_7d; do mv "$TMP/$r.out" "$TMP/$r.json" 2>/dev/null; done
 echo "Selesai ambil data dalam $((SECONDS - FETCH_START)) detik"
 
 # Resource wajib, jika gagal hasil analisa tidak valid
@@ -169,7 +190,8 @@ for r in namespaces nodes pods; do
   fi
 done
 # deploymentconfigs boleh gagal (capability DeploymentConfig bisa dinonaktifkan di OCP 4.14+)
-FETCH_FAILED=$(grep -vx deploymentconfigs "$TMP/failed.txt" 2>/dev/null | xargs)
+# pvc_used_7d boleh gagal/kosong (PVC baru atau retention Prometheus < 7 hari)
+FETCH_FAILED=$(grep -vxE 'deploymentconfigs|pvc_used_7d' "$TMP/failed.txt" 2>/dev/null | xargs)
 
 ############################ ANALYZER ############################
 cat > "$TMP/analyze.py" <<'PYEOF'
@@ -186,7 +208,8 @@ T_LOW = float(E.get('LOW_USAGE', 10))
 T_QUOTA = float(E.get('QUOTA_THRESHOLD', 85))
 T_RST = int(E.get('RESTART_THRESHOLD', 5))
 T_HK = int(E.get('HOUSEKEEP_THRESHOLD', 50))
-T_MAXPODS = int(E.get('MAX_PODS_SUPPORTED', 500))
+T_MAXPODS = int(E.get('MAX_PODS_WARN', 2000))
+T_PVC = float(E.get('PVC_THRESHOLD', 85))
 APPS_DOMAIN = E.get('APPS_DOMAIN', '')
 from datetime import datetime, timezone
 NOW = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -274,7 +297,7 @@ def table(name, header, rows, csv_only=False):
             for r in rows:
                 f.write('\t'.join(r) + '\n')
     if OUT and rows:
-        with open(os.path.join(OUT, name + '.csv'), 'w', newline='') as f:
+        with open(os.path.join(OUT, 'report-' + name + '.csv'), 'w', newline='') as f:
             w = csv.writer(f)
             w.writerow(header)
             w.writerows(rows)
@@ -620,6 +643,17 @@ for b in load('poddisruptionbudgets'):
     PDB_ROWS.append([ns, name, sp.get('minAvailable', '-'), sp.get('maxUnavailable', '-'), exp,
                      st.get('currentHealthy', 0), allowed, ','.join(sorted(k[2] for k in wls)), tag])
 
+# ---------- usage pvc (prometheus) ----------
+def prom(name):
+    try:
+        with open(os.path.join(D, name + '.json')) as f:
+            res = json.load(f)['data']['result']
+        return {(r['metric'].get('namespace'), r['metric'].get('persistentvolumeclaim')): float(r['value'][1]) for r in res}
+    except Exception:
+        return None
+P_USED, P_CAP, P_USED7 = prom('pvc_used'), prom('pvc_cap'), prom('pvc_used_7d')
+HAS_PVC_METRIC = bool(P_USED)
+
 # ---------- pvc ----------
 PVC_USERS = defaultdict(set); PVC_DONE = Counter()
 for p in PODS:
@@ -629,7 +663,7 @@ for p in PODS:
         if p['active']: PVC_USERS[(p['ns'], c)].add(p['wl'][2] if p['wl'] else p['name'])
         else: PVC_DONE[(p['ns'], c)] += 1
 
-PVC_ROWS = []; PVC_CNT = Counter(); PVC_SIZE = defaultdict(float); pvc_bad = []; pvc_unused = 0
+PVC_ROWS = []; PVC_CNT = Counter(); PVC_SIZE = defaultdict(float); PVC_USEDNS = defaultdict(float); pvc_bad = []; pvc_unused = 0; pvc_high = []
 for c in load('persistentvolumeclaims'):
     if not isapp(c): continue
     ns, name = c['metadata']['namespace'], c['metadata']['name']
@@ -645,8 +679,22 @@ for c in load('persistentvolumeclaims'):
     elif not users:
         tag = 'UNUSED'; pvc_unused += 1
     PVC_CNT[ns] += 1; PVC_SIZE[ns] += mem(size) or 0
-    PVC_ROWS.append([ns, name, phase, size, sp.get('storageClassName'), ','.join(sp.get('accessModes') or []),
-                     sp.get('volumeMode', 'Filesystem'), ','.join(users), tag])
+    used = (P_USED or {}).get((ns, name)); cap = (P_CAP or {}).get((ns, name)) or mem(size)
+    used7 = (P_USED7 or {}).get((ns, name))
+    up = pct(used, cap)
+    growth = (used - used7) / 7 if used is not None and used7 is not None else None
+    full = '-'
+    if growth is not None and growth > 0 and cap and used is not None:
+        full = '%d hari' % ((cap - used) / growth)
+    elif growth is not None:
+        full = 'tidak naik'
+    if used is not None: PVC_USEDNS[ns] += used
+    if up is not None and up > T_PVC:
+        pvc_high.append('%s/%s(%s)' % (ns, name, fp(up)))
+        tag = 'HIGH_USAGE' if tag == 'OK' else tag + ',HIGH_USAGE'
+    gtxt = '-' if growth is None else ('%s%s/hari' % ('+' if growth >= 0 else '-', fm(abs(growth))))
+    PVC_ROWS.append([ns, name, phase, size, fm(used), fp(up), gtxt, full, sp.get('storageClassName'),
+                     ','.join(sp.get('accessModes') or []), sp.get('volumeMode', 'Filesystem'), ','.join(users), tag])
 
 # ---------- quota & limitrange ----------
 def qval(res, v):
@@ -820,12 +868,14 @@ for ns in sorted(APP):
              mr=ssum(p['mr'] for p in act), ml=ssum(p['ml_raw'] for p in act) or None, mu=ssum(p['mu'] for p in act))
     for k, x in v.items(): TT[k] += x or 0
     rows.append([ns, len(act), fc(v['cr']), fc(v['cl']), fc(v['cu']), fp(pct(v['cu'], v['cr'])),
-                 fm(v['mr']), fm(v['ml']), fm(v['mu']), fp(pct(v['mu'], v['mr'])), fm(PVC_SIZE[ns]) if PVC_CNT[ns] else '-'])
+                 fm(v['mr']), fm(v['ml']), fm(v['mu']), fp(pct(v['mu'], v['mr'])), fm(PVC_SIZE[ns]) if PVC_CNT[ns] else '-',
+                 fm(PVC_USEDNS[ns]) if PVC_CNT[ns] and HAS_PVC_METRIC else '-'])
 if rows:
     rows.append(['TOTAL', sum(r[1] for r in rows), fc(TT['cr']), fc(TT['cl']), fc(TT['cu']), fp(pct(TT['cu'], TT['cr'])),
-                 fm(TT['mr']), fm(TT['ml']), fm(TT['mu']), fp(pct(TT['mu'], TT['mr'])), fm(sum(PVC_SIZE.values()))])
+                 fm(TT['mr']), fm(TT['ml']), fm(TT['mu']), fp(pct(TT['mu'], TT['mr'])), fm(sum(PVC_SIZE.values())),
+                 fm(sum(PVC_USEDNS.values())) if HAS_PVC_METRIC else '-'])
 table('ns_utilization', ['NAMESPACE', 'ACTIVE_PODS', 'CPU_REQ', 'CPU_LIM', 'CPU_USE', 'CPU%REQ',
-                         'MEM_REQ', 'MEM_LIM', 'MEM_USE', 'MEM%REQ', 'PVC_SIZE'], rows)
+                         'MEM_REQ', 'MEM_LIM', 'MEM_USE', 'MEM%REQ', 'PVC_SIZE', 'PVC_USED'], rows)
 
 rows = []; high = []; over = []
 for w in WLS:
@@ -943,13 +993,20 @@ else:
 # ============================================================
 # 7. PVC
 # ============================================================
-table('pvc', ['NAMESPACE', 'PVC', 'STATUS', 'CAPACITY', 'STORAGECLASS', 'ACCESS', 'MODE', 'USED_BY', 'RESULT'], sorted(PVC_ROWS))
+table('pvc', ['NAMESPACE', 'PVC', 'STATUS', 'CAPACITY', 'USED', 'USE%', 'GROWTH_7D', 'EST_FULL', 'STORAGECLASS',
+              'ACCESS', 'MODE', 'USED_BY', 'RESULT'], sorted(PVC_ROWS))
+nometric = '' if HAS_PVC_METRIC else '; usage PVC tidak tersedia (Thanos tidak bisa diakses)'
 if not APP:
     result('Check PVC', 'SKIP', 'Tidak ada namespace aplikasi')
-elif pvc_bad:
-    result('Check PVC', 'WARN', '%d PVC tidak Bound: %s' % (len(pvc_bad), lst(pvc_bad, 3)))
+elif pvc_bad or pvc_high:
+    d = []
+    if pvc_bad: d.append('%d PVC tidak Bound: %s' % (len(pvc_bad), lst(pvc_bad, 3)))
+    if pvc_high: d.append('%d PVC usage > %d%%: %s' % (len(pvc_high), T_PVC, lst(pvc_high, 3)))
+    result('Check PVC', 'WARN', '; '.join(d) + nometric)
+elif not HAS_PVC_METRIC and PVC_ROWS:
+    result('Check PVC', 'WARN', '%d PVC Bound' % len(PVC_ROWS) + nometric)
 else:
-    result('Check PVC', 'PASS', '%d PVC Bound' % len(PVC_ROWS) + (', %d tidak dipakai pod manapun (info)' % pvc_unused if pvc_unused else ''))
+    result('Check PVC', 'PASS', '%d PVC Bound, usage < %d%%' % (len(PVC_ROWS), T_PVC) + (', %d tidak dipakai pod manapun (info)' % pvc_unused if pvc_unused else ''))
 
 # ============================================================
 # 8. UTILISASI NODE
@@ -1006,7 +1063,7 @@ if node_fail:
 elif node_warn or maxpods:
     d = []
     if node_warn: d.append('Di atas %d%%: %s' % (T_NODE, lst(node_warn, 3)))
-    if maxpods: d.append('maxPods %s di %d node (supported %d)' % ('/'.join(str(k) for k in maxpods), sum(maxpods.values()), T_MAXPODS))
+    if maxpods: d.append('maxPods %s di %d node (batas %d)' % ('/'.join(str(k) for k in maxpods), sum(maxpods.values()), T_MAXPODS))
     if node_info: d.append('memory lebih kecil dari node se-role: %s' % lst(node_info, 3))
     result('Check Node Utilization', 'WARN', '; '.join(d))
 elif not any(n['use_cpu'] is not None for n in NODES.values()):
@@ -1024,14 +1081,15 @@ with open(os.path.join(D, 'overview.tsv'), 'w') as f:
                  ('Container', ctot),
                  ('CPU request / usage', '%s / %s core' % (fc(TT['cr']), fc(TT['cu']) if HAS_METRICS else '-')),
                  ('Memory request / usage', '%s / %s' % (fm(TT['mr']), fm(TT['mu']) if HAS_METRICS else '-')),
-                 ('Metrics', 'tersedia' if HAS_METRICS else 'TIDAK tersedia')):
+                 ('Metrics pod/node', 'tersedia' if HAS_METRICS else 'TIDAK tersedia'),
+                 ('Metrics PVC (Thanos)', 'tersedia' if HAS_PVC_METRIC else 'TIDAK tersedia')):
         f.write('%s\t: %s\n' % (k, clean(v)))
 with open(os.path.join(D, 'results.tsv'), 'w') as f:
     for k, s, d in RESULTS:
         f.write('%s\t%s\t%s\n' % (k, s, d))
 PYEOF
 
-export PLATFORM_NS_REGEX INCLUDE_NS_REGEX RES_THRESHOLD POD_THRESHOLD LOW_USAGE QUOTA_THRESHOLD RESTART_THRESHOLD HOUSEKEEP_THRESHOLD MAX_PODS_SUPPORTED APPS_DOMAIN
+export PLATFORM_NS_REGEX INCLUDE_NS_REGEX RES_THRESHOLD POD_THRESHOLD LOW_USAGE QUOTA_THRESHOLD RESTART_THRESHOLD HOUSEKEEP_THRESHOLD MAX_PODS_WARN PVC_THRESHOLD APPS_DOMAIN
 if ! "$PY" "$TMP/analyze.py" "$TMP" "$CSV_DIR"; then
   echo -e "${RED}Analisa data gagal, cek error python di atas.${NC}"
   exit 1
@@ -1093,13 +1151,16 @@ sub "LimitRange"
 show limitrange "Tidak ada LimitRange"
 
 ############################ 7. PVC ############################
-section "7. PVC APLIKASI"
+section "7. PVC APLIKASI (threshold ${PVC_THRESHOLD}%)"
+echo "USED dari kubelet_volume_stats (Thanos), GROWTH_7D = rata rata kenaikan per hari 7 hari terakhir, EST_FULL = estimasi sisa hari sampai penuh"
+echo "Catatan: PVC block mode (volumeMode Block) dan PVC yang tidak sedang di-mount pod tidak punya data usage"
+echo
 show pvc "Tidak ada PVC"
 
 ############################ 8. UTILISASI NODE ############################
 section "8. UTILISASI NODE (threshold ${RES_THRESHOLD}%)"
 echo "USE = usage aktual (oc adm top), REQ/LIM = total request/limit semua pod di node vs allocatable"
-echo "MAXPODS_x = maxPods di atas ${MAX_PODS_SUPPORTED} (batas supported), MEM_LIM_OVERCOMMIT dan SMALLER_THAN_PEER = info"
+echo "MAXPODS_x = maxPods di atas ${MAX_PODS_WARN}, MEM_LIM_OVERCOMMIT dan SMALLER_THAN_PEER = info"
 echo
 show node_utilization
 sub "Kapasitas per role (FREE_REQ = sisa allocatable yang belum di-request)"
