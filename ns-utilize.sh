@@ -1032,7 +1032,7 @@ for c in load('persistentvolumeclaims'):
     SC_PROV[sc] += size or 0; SC_CNT[sc] += 1
     if isapp(c): SC_APP[sc] += size or 0
 
-rows = []
+rows = []; odf_prov = 0; odf_pools = {}; odf_over = []
 for sc in sorted(load('storageclasses'), key=lambda x: x['metadata']['name']):
     name = sc['metadata']['name']; prov = sc.get('provisioner', ''); prm = sc.get('parameters') or {}
     if prov.endswith('rbd.csi.ceph.com'):
@@ -1042,6 +1042,8 @@ for sc in sorted(load('storageclasses'), key=lambda x: x['metadata']['name']):
     else:
         continue
     stored, avail, stored7 = PS.get(pool), PA.get(pool), PS7.get(pool)
+    odf_prov += SC_PROV[name]
+    if stored is not None: odf_pools[pool] = (stored, avail or 0)
     usable = stored + avail if stored is not None and avail is not None else None
     up = pct(stored, usable)
     tag = 'OK'
@@ -1049,6 +1051,7 @@ for sc in sorted(load('storageclasses'), key=lambda x: x['metadata']['name']):
         tag = 'HIGH'; odf_warn.append('%s %s' % (name, fp(up)))
     if usable and SC_PROV[name] > usable:
         tag = tag + ',PROVISIONED>USABLE' if tag != 'OK' else 'PROVISIONED>USABLE'
+        odf_over.append('%s %s' % (name, fp(pct(SC_PROV[name], usable))))
     rows.append([name, pool, SC_CNT[name], fm(SC_PROV[name]), fm(SC_APP[name]) if SC_APP[name] else '-',
                  fm(stored), fm(avail), fp(up), fp(pct(SC_PROV[name], usable)), growth_txt(stored, stored7), tag])
 table('odf_storageclass', ['STORAGECLASS', 'POOL', 'PVC', 'PROVISIONED', 'PROV_APP', 'STORED', 'MAX_AVAIL', 'USE%',
@@ -1059,7 +1062,14 @@ if not C_TOT and not PS:
 elif odf_warn:
     result('Check ODF Capacity', 'WARN', 'Di atas %d%%: %s' % (T_ODF, ', '.join(odf_warn)))
 else:
-    result('Check ODF Capacity', 'PASS', 'Raw Ceph %s terpakai, semua pool < %d%%' % (fp(pct(C_USED, C_TOT)), T_ODF))
+    # MAX_AVAIL semua pool berbagi kapasitas raw yang sama, jadi usable total = semua STORED + 1x MAX_AVAIL
+    tot_usable = sum(v[0] for v in odf_pools.values()) + max([v[1] for v in odf_pools.values()] or [0])
+    d = 'Raw Ceph %s terpakai, semua pool < %d%%' % (fp(pct(C_USED, C_TOT)), T_ODF)
+    if tot_usable:
+        d += '; total PVC ODF %s dari usable %s (%s, thin provisioning)' % (fm(odf_prov), fm(tot_usable), fp(pct(odf_prov, tot_usable)))
+    if odf_over:
+        d += '; provisioned > usable (info): %s' % ', '.join(odf_over)
+    result('Check ODF Capacity', 'PASS', d)
 
 # ============================================================
 # 8. UTILISASI NODE
@@ -1212,6 +1222,7 @@ show odf_cluster "Metric Ceph tidak tersedia (cluster tidak pakai ODF atau Thano
 echo
 echo "PROVISIONED = total kapasitas PVC di storage class (semua namespace), PROV_APP = porsi namespace aplikasi"
 echo "STORED = data aktual di pool (sebelum replica), MAX_AVAIL = sisa kapasitas usable pool, PROV%USABLE = provisioned dibanding usable (STORED + MAX_AVAIL)"
+echo "Catatan: MAX_AVAIL semua pool berbagi kapasitas raw yang sama, tidak bisa dijumlahkan"
 show odf_storageclass "Tidak ada storage class ODF"
 
 ############################ 8. UTILISASI NODE ############################
