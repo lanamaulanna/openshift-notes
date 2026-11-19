@@ -33,7 +33,7 @@ RESTART_THRESHOLD=5      # jumlah restart pod, di atas/sama dengan nilai ini = W
 # Namespace platform yang di-exclude (regex full name)
 # Namespace dengan label openshift.io/cluster-monitoring=true juga otomatis di-exclude
 # Tambahkan namespace platform/operator lain sesuai cluster
-PLATFORM_NS_REGEX="${PLATFORM_NS_REGEX:-^(openshift|openshift-.*|kube-.*|default|stackrox|rhacs-operator|open-cluster-management.*|multicluster-engine|hive|cert-manager.*|trident|ibm-common-services|nvidia-gpu-operator|redhat-ods-.*|knative-.*|istio-system)$}"
+PLATFORM_NS_REGEX="${PLATFORM_NS_REGEX:-^(openshift|openshift-.*|kube-.*|default|stackrox|rhacs-operator|open-cluster-management.*|multicluster-engine|hive|cert-manager.*|nvidia-gpu-operator|redhat-ods-.*|knative-.*|istio-system)$}"
 INCLUDE_NS_REGEX="${INCLUDE_NS_REGEX:-}"
 
 ############################ SETUP ############################
@@ -114,7 +114,7 @@ show() {
 CLUSTER_VERSION=$(oc get clusterversion version -o jsonpath='{.status.desired.version}')
 API_URL=$(oc whoami --show-server)
 
-section "PMAPP WORKLOAD CHECK : ${ENV_NAME}"
+section "WORKLOAD CHECK : ${ENV_NAME}"
 echo "Date         : $(date '+%Y-%m-%d %H:%M:%S %Z')"
 echo "API          : ${API_URL}"
 echo "Console      : ${CONSOLE_URL:-$(oc whoami --show-console 2>/dev/null)}"
