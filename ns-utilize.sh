@@ -17,7 +17,7 @@
 #   4. Utilisasi pod        : usage vs request/limit per namespace, per workload, pod bermasalah
 #   5. Resource config      : request/limit/probe per container
 #   6. Quota & LimitRange
-#   7. PVC aplikasi         : status, kapasitas, usage aktual (Thanos), growth 7 hari, estimasi penuh
+#   7. PVC aplikasi         : status, kapasitas, usage aktual (Thanos), growth 7 hari
 #   8. Utilisasi node       : usage aktual, total request/limit vs allocatable, sisa kapasitas, ukuran node
 #   Best practice           : probe, image :latest, route tanpa TLS, PDB
 #
@@ -680,19 +680,13 @@ for c in load('persistentvolumeclaims'):
     used7 = (P_USED7 or {}).get((ns, name))
     up = pct(used, cap)
     growth = (used - used7) / 7 if used is not None and used7 is not None else None
-    full = '-'
-    if growth is not None and growth > 0 and cap and used is not None:
-        dleft = (cap - used) / growth
-        full = '> 1 tahun' if dleft > 365 else '%d hari' % dleft
-    elif growth is not None:
-        full = 'tidak naik'
     if used is not None:
         PVC_USEDNS[ns] += used; PVC_HASM.add(ns); pvc_metric += 1
     if up is not None and up > T_PVC:
         pvc_high.append('%s/%s(%s)' % (ns, name, fp(up)))
         tag = 'HIGH_USAGE' if tag == 'OK' else tag + ',HIGH_USAGE'
     gtxt = '-' if growth is None else ('%s%s/hari' % ('+' if growth >= 0 else '-', fm(abs(growth))))
-    PVC_ROWS.append([ns, name, phase, size, fm(used), fp(up), gtxt, full, sp.get('storageClassName'),
+    PVC_ROWS.append([ns, name, phase, size, fm(used), fp(up), gtxt, sp.get('storageClassName'),
                      ','.join(sp.get('accessModes') or []), sp.get('volumeMode', 'Filesystem'), ','.join(users), tag])
 
 # ---------- quota & limitrange ----------
@@ -974,7 +968,7 @@ else:
 # ============================================================
 # 7. PVC
 # ============================================================
-table('pvc', ['NAMESPACE', 'PVC', 'STATUS', 'CAPACITY', 'USED', 'USE%', 'GROWTH_7D', 'EST_FULL', 'STORAGECLASS',
+table('pvc', ['NAMESPACE', 'PVC', 'STATUS', 'CAPACITY', 'USED', 'USE%', 'GROWTH_7D', 'STORAGECLASS',
               'ACCESS', 'MODE', 'USED_BY', 'RESULT'], sorted(PVC_ROWS))
 nometric = '' if HAS_PVC_METRIC else '; usage PVC tidak tersedia (Thanos tidak bisa diakses)'
 if not APP:
@@ -1131,7 +1125,7 @@ show limitrange "Tidak ada LimitRange"
 
 ############################ 7. PVC ############################
 section "7. PVC APLIKASI (threshold ${PVC_THRESHOLD}%)"
-echo "USED dari kubelet_volume_stats (Thanos), GROWTH_7D = rata rata kenaikan per hari 7 hari terakhir, EST_FULL = estimasi sisa hari sampai penuh"
+echo "USED dari kubelet_volume_stats (Thanos), GROWTH_7D = rata rata kenaikan per hari 7 hari terakhir"
 echo "Catatan: PVC block mode (volumeMode Block) dan PVC yang tidak sedang di-mount pod tidak punya data usage"
 echo
 show pvc "Tidak ada PVC"
