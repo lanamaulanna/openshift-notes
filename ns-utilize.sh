@@ -17,7 +17,7 @@
 #   4. Utilisasi pod        : usage vs request/limit per namespace, per workload, pod bermasalah
 #   5. Resource config      : request/limit/probe per container
 #   6. Quota & LimitRange
-#   7. PVC aplikasi         : status, kapasitas, usage aktual (Thanos), growth 7 hari
+#   7. PVC aplikasi         : status, kapasitas, usage aktual (Thanos), growth 7 hari, kapasitas ODF per storage class
 #   8. Utilisasi node       : usage aktual, total request/limit vs allocatable, sisa kapasitas, ukuran node
 #   Best practice           : probe, image :latest, route tanpa TLS, PDB
 #
@@ -33,6 +33,7 @@ RESTART_THRESHOLD=5      # jumlah restart pod, di atas/sama dengan nilai ini = W
 OC_TIMEOUT=300s          # timeout per request oc get, supaya tidak menggantung
 MAX_PODS_WARN=2000       # maxPods node di atas nilai ini = WARN (sesuaikan desain cluster, contoh hostPrefix /20 = 2000)
 PVC_THRESHOLD=85         # persen usage PVC, di atas nilai ini = WARN
+ODF_THRESHOLD=75         # persen usage raw Ceph / pool ODF, di atas nilai ini = WARN (ODF alert nearfull di 75%)
 
 # Namespace platform yang di-exclude (regex full name)
 # Namespace dengan label openshift.io/cluster-monitoring=true juga otomatis di-exclude
@@ -79,7 +80,7 @@ exec > >(tee >(sed 's/\x1b\[[0-9;]*m//g' >> "$LOG_FILE")) 2>&1
 
 declare -A RES DET
 INVENTORY_KEYS=("Check App Pods" "Check Workload Replica" "Check Pod Distribution" "Check PDB" "Check PVC")
-CAPACITY_KEYS=("Check Pod Utilization" "Check Resource Limit" "Check Quota" "Check Node Utilization")
+CAPACITY_KEYS=("Check Pod Utilization" "Check Resource Limit" "Check Quota" "Check Node Utilization" "Check ODF Capacity")
 PRACTICE_KEYS=("Check Probe" "Check Image Tag" "Check Route TLS")
 
 set_result() { RES["$1"]="$2"; DET["$1"]="$3"; }
@@ -133,7 +134,7 @@ echo "Mengambil data dari cluster..."
 # Ambil semua object sekali (paralel), analisa offline di python
 # replicasets & jobs tidak diambil (paling berat), owner dihitung dari nama pod/label
 # Progress per resource ditampilkan dengan durasi dan ukuran, error disimpan ke .err
-RESOURCES="namespaces nodes pods deployments statefulsets daemonsets deploymentconfigs cronjobs horizontalpodautoscalers poddisruptionbudgets services routes persistentvolumeclaims resourcequotas limitranges"
+RESOURCES="namespaces nodes pods deployments statefulsets daemonsets deploymentconfigs cronjobs horizontalpodautoscalers poddisruptionbudgets services routes persistentvolumeclaims storageclasses resourcequotas limitranges"
 fetch() {
   local name="$1"; shift
   local t0=$SECONDS rc
@@ -172,11 +173,19 @@ fetch top_pods oc adm top pods -A --no-headers & PIDS+=($!)
 fetch pvc_used prom_query "$PVC_BY (kubelet_volume_stats_used_bytes)" & PIDS+=($!)
 fetch pvc_cap prom_query "$PVC_BY (kubelet_volume_stats_capacity_bytes)" & PIDS+=($!)
 fetch pvc_used_7d prom_query "$PVC_BY (kubelet_volume_stats_used_bytes offset 7d)" & PIDS+=($!)
+# Kapasitas ODF (metric Ceph), kosong jika cluster tidak pakai ODF
+POOL_JOIN='* on (pool_id) group_left(name) max by (pool_id, name) (ceph_pool_metadata)'
+fetch ceph_total prom_query "max(ceph_cluster_total_bytes)" & PIDS+=($!)
+fetch ceph_used prom_query "max(ceph_cluster_total_used_raw_bytes)" & PIDS+=($!)
+fetch ceph_used_7d prom_query "max(ceph_cluster_total_used_raw_bytes offset 7d)" & PIDS+=($!)
+fetch pool_stored prom_query "max by (name) (max by (pool_id) (ceph_pool_stored) $POOL_JOIN)" & PIDS+=($!)
+fetch pool_avail prom_query "max by (name) (max by (pool_id) (ceph_pool_max_avail) $POOL_JOIN)" & PIDS+=($!)
+fetch pool_stored_7d prom_query "max by (name) (max by (pool_id) (ceph_pool_stored offset 7d) $POOL_JOIN)" & PIDS+=($!)
 wait "${PIDS[@]}"
 for r in $RESOURCES; do mv "$TMP/$r.out" "$TMP/$r.json" 2>/dev/null; done
 mv "$TMP/top_nodes.out" "$TMP/top_nodes.txt" 2>/dev/null
 mv "$TMP/top_pods.out" "$TMP/top_pods.txt" 2>/dev/null
-for r in pvc_used pvc_cap pvc_used_7d; do mv "$TMP/$r.out" "$TMP/$r.json" 2>/dev/null; done
+for r in pvc_used pvc_cap pvc_used_7d ceph_total ceph_used ceph_used_7d pool_stored pool_avail pool_stored_7d; do mv "$TMP/$r.out" "$TMP/$r.json" 2>/dev/null; done
 echo "Selesai ambil data dalam $((SECONDS - FETCH_START)) detik"
 
 # Resource wajib, jika gagal hasil analisa tidak valid
@@ -189,7 +198,7 @@ for r in namespaces nodes pods; do
 done
 # deploymentconfigs boleh gagal (capability DeploymentConfig bisa dinonaktifkan di OCP 4.14+)
 # pvc_used_7d boleh gagal/kosong (PVC baru atau retention Prometheus < 7 hari)
-FETCH_FAILED=$(grep -vxE 'deploymentconfigs|pvc_used_7d' "$TMP/failed.txt" 2>/dev/null | xargs)
+FETCH_FAILED=$(grep -vxE 'deploymentconfigs|pvc_used_7d|ceph_.*|pool_.*' "$TMP/failed.txt" 2>/dev/null | xargs)
 
 ############################ ANALYZER ############################
 cat > "$TMP/analyze.py" <<'PYEOF'
@@ -207,6 +216,7 @@ T_QUOTA = float(E.get('QUOTA_THRESHOLD', 85))
 T_RST = int(E.get('RESTART_THRESHOLD', 5))
 T_MAXPODS = int(E.get('MAX_PODS_WARN', 2000))
 T_PVC = float(E.get('PVC_THRESHOLD', 85))
+T_ODF = float(E.get('ODF_THRESHOLD', 75))
 APPS_DOMAIN = E.get('APPS_DOMAIN', '')
 from datetime import datetime, timezone
 NOW = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -262,6 +272,7 @@ def fc(m):
 
 def fm(b):
     if b is None: return '-'
+    if b >= 2**40: return '%.2fTi' % (b / 2**40)
     return '%.1fGi' % (b / 2**30) if b >= 2**30 else '%dMi' % round(b / 2**20)
 
 def pct(a, b):
@@ -649,6 +660,16 @@ def prom(name):
     except Exception:
         return None
 P_USED, P_CAP, P_USED7 = prom('pvc_used'), prom('pvc_cap'), prom('pvc_used_7d')
+
+def promv(name, label=None):
+    try:
+        with open(os.path.join(D, name + '.json')) as f:
+            res = json.load(f)['data']['result']
+        if label is None:
+            return float(res[0]['value'][1]) if res else None
+        return {r['metric'].get(label): float(r['value'][1]) for r in res}
+    except Exception:
+        return None if label is None else {}
 HAS_PVC_METRIC = bool(P_USED)
 
 # ---------- pvc ----------
@@ -983,6 +1004,63 @@ elif not HAS_PVC_METRIC and PVC_ROWS:
 else:
     result('Check PVC', 'PASS', '%d PVC Bound, usage < %d%% (data usage tersedia %d PVC, sisanya tidak di-mount pod aktif)' % (len(PVC_ROWS), T_PVC, pvc_metric) + (', %d tidak dipakai pod manapun (info)' % pvc_unused if pvc_unused else ''))
 
+# ---------- kapasitas ODF ----------
+C_TOT, C_USED, C_USED7 = promv('ceph_total'), promv('ceph_used'), promv('ceph_used_7d')
+PS, PA, PS7 = promv('pool_stored', 'name'), promv('pool_avail', 'name'), promv('pool_stored_7d', 'name')
+def growth_txt(now, old):
+    if now is None or old is None: return '-'
+    g = (now - old) / 7
+    return '%s%s/hari' % ('+' if g >= 0 else '-', fm(abs(g)))
+
+odf_warn = []
+rows = []
+if C_TOT:
+    cp = pct(C_USED, C_TOT)
+    tag = 'OK'
+    if cp is not None and cp > T_ODF:
+        tag = 'HIGH'; odf_warn.append('raw %s' % fp(cp))
+    rows.append(['Ceph raw (semua replica)', fm(C_TOT), fm(C_USED), fp(cp), fm(C_TOT - C_USED) if C_USED is not None else '-',
+                 growth_txt(C_USED, C_USED7), tag])
+table('odf_cluster', ['SCOPE', 'TOTAL', 'USED', 'USE%', 'FREE', 'GROWTH_7D', 'RESULT'], rows)
+
+# provisioned PVC per storage class (semua namespace, termasuk platform)
+SC_PROV = defaultdict(float); SC_APP = defaultdict(float); SC_CNT = Counter()
+for c in load('persistentvolumeclaims'):
+    sc = (c.get('spec') or {}).get('storageClassName')
+    st = c.get('status') or {}
+    size = mem((st.get('capacity') or {}).get('storage') or (((c.get('spec') or {}).get('resources') or {}).get('requests') or {}).get('storage'))
+    SC_PROV[sc] += size or 0; SC_CNT[sc] += 1
+    if isapp(c): SC_APP[sc] += size or 0
+
+rows = []
+for sc in sorted(load('storageclasses'), key=lambda x: x['metadata']['name']):
+    name = sc['metadata']['name']; prov = sc.get('provisioner', ''); prm = sc.get('parameters') or {}
+    if prov.endswith('rbd.csi.ceph.com'):
+        pool = prm.get('pool')
+    elif prov.endswith('cephfs.csi.ceph.com'):
+        pool = prm.get('pool') or (prm.get('fsName', '') + '-data0')
+    else:
+        continue
+    stored, avail, stored7 = PS.get(pool), PA.get(pool), PS7.get(pool)
+    usable = stored + avail if stored is not None and avail is not None else None
+    up = pct(stored, usable)
+    tag = 'OK'
+    if up is not None and up > T_ODF:
+        tag = 'HIGH'; odf_warn.append('%s %s' % (name, fp(up)))
+    if usable and SC_PROV[name] > usable:
+        tag = tag + ',PROVISIONED>USABLE' if tag != 'OK' else 'PROVISIONED>USABLE'
+    rows.append([name, pool, SC_CNT[name], fm(SC_PROV[name]), fm(SC_APP[name]) if SC_APP[name] else '-',
+                 fm(stored), fm(avail), fp(up), fp(pct(SC_PROV[name], usable)), growth_txt(stored, stored7), tag])
+table('odf_storageclass', ['STORAGECLASS', 'POOL', 'PVC', 'PROVISIONED', 'PROV_APP', 'STORED', 'MAX_AVAIL', 'USE%',
+                           'PROV%USABLE', 'GROWTH_7D', 'RESULT'], rows)
+
+if not C_TOT and not PS:
+    result('Check ODF Capacity', 'SKIP', 'Metric Ceph tidak tersedia (bukan ODF atau Thanos tidak bisa diakses)')
+elif odf_warn:
+    result('Check ODF Capacity', 'WARN', 'Di atas %d%%: %s' % (T_ODF, ', '.join(odf_warn)))
+else:
+    result('Check ODF Capacity', 'PASS', 'Raw Ceph %s terpakai, semua pool < %d%%' % (fp(pct(C_USED, C_TOT)), T_ODF))
+
 # ============================================================
 # 8. UTILISASI NODE
 # ============================================================
@@ -1064,7 +1142,7 @@ with open(os.path.join(D, 'results.tsv'), 'w') as f:
         f.write('%s\t%s\t%s\n' % (k, s, d))
 PYEOF
 
-export PLATFORM_NS_REGEX INCLUDE_NS_REGEX RES_THRESHOLD POD_THRESHOLD LOW_USAGE QUOTA_THRESHOLD RESTART_THRESHOLD MAX_PODS_WARN PVC_THRESHOLD APPS_DOMAIN
+export PLATFORM_NS_REGEX INCLUDE_NS_REGEX RES_THRESHOLD POD_THRESHOLD LOW_USAGE QUOTA_THRESHOLD RESTART_THRESHOLD MAX_PODS_WARN PVC_THRESHOLD ODF_THRESHOLD APPS_DOMAIN
 if ! "$PY" "$TMP/analyze.py" "$TMP" "$CSV_DIR"; then
   echo -e "${RED}Analisa data gagal, cek error python di atas.${NC}"
   exit 1
@@ -1129,6 +1207,12 @@ echo "USED dari kubelet_volume_stats (Thanos), GROWTH_7D = rata rata kenaikan pe
 echo "Catatan: PVC block mode (volumeMode Block) dan PVC yang tidak sedang di-mount pod tidak punya data usage"
 echo
 show pvc "Tidak ada PVC"
+sub "Kapasitas ODF (threshold ${ODF_THRESHOLD}%)"
+show odf_cluster "Metric Ceph tidak tersedia (cluster tidak pakai ODF atau Thanos tidak bisa diakses)"
+echo
+echo "PROVISIONED = total kapasitas PVC di storage class (semua namespace), PROV_APP = porsi namespace aplikasi"
+echo "STORED = data aktual di pool (sebelum replica), MAX_AVAIL = sisa kapasitas usable pool, PROV%USABLE = provisioned dibanding usable (STORED + MAX_AVAIL)"
+show odf_storageclass "Tidak ada storage class ODF"
 
 ############################ 8. UTILISASI NODE ############################
 section "8. UTILISASI NODE (threshold ${RES_THRESHOLD}%)"
