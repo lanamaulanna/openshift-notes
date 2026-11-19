@@ -809,7 +809,7 @@ else:
 wl_down = ['%s/%s' % (w['ns'], w['name']) for w in WLS if 'DOWN' in w['tags']]
 wl_deg = ['%s/%s' % (w['ns'], w['name']) for w in WLS if 'DEGRADED' in w['tags']]
 wl_zero = sum(1 for w in WLS if 'SCALED_0' in w['tags'])
-wl_cnt = sum(1 for w in WLS if w['kind'] != 'CronJob')
+wl_cnt = sum(1 for w in WLS if w['kind'] != 'CronJob' and 'SCALED_0' not in w['tags'])
 if not APP:
     result('Check Workload Replica', 'SKIP', 'Tidak ada namespace aplikasi')
 elif wl_down:
