@@ -19,7 +19,6 @@
 #   6. Quota & LimitRange
 #   7. PVC aplikasi         : status, kapasitas, usage aktual (Thanos), growth 7 hari, estimasi penuh
 #   8. Utilisasi node       : usage aktual, total request/limit vs allocatable, sisa kapasitas, ukuran node
-#   Housekeeping            : pod Completed/Failed/Evicted yang menumpuk
 #   Best practice           : probe, image :latest, route tanpa TLS, PDB
 #
 
@@ -32,7 +31,6 @@ LOW_USAGE=10             # persen usage terhadap request, di bawah nilai ini = O
 QUOTA_THRESHOLD=85       # persen pemakaian ResourceQuota, di atas nilai ini = WARN
 RESTART_THRESHOLD=5      # jumlah restart pod, di atas/sama dengan nilai ini = WARN
 OC_TIMEOUT=300s          # timeout per request oc get, supaya tidak menggantung
-HOUSEKEEP_THRESHOLD=50   # jumlah pod Completed/Failed/Evicted per namespace, di atas nilai ini = WARN
 MAX_PODS_WARN=2000       # maxPods node di atas nilai ini = WARN (sesuaikan desain cluster, contoh hostPrefix /20 = 2000)
 PVC_THRESHOLD=85         # persen usage PVC, di atas nilai ini = WARN
 
@@ -80,7 +78,7 @@ mkdir -p "$CSV_DIR"
 exec > >(tee >(sed 's/\x1b\[[0-9;]*m//g' >> "$LOG_FILE")) 2>&1
 
 declare -A RES DET
-INVENTORY_KEYS=("Check App Pods" "Check Workload Replica" "Check Pod Distribution" "Check PDB" "Check PVC" "Check Housekeeping")
+INVENTORY_KEYS=("Check App Pods" "Check Workload Replica" "Check Pod Distribution" "Check PDB" "Check PVC")
 CAPACITY_KEYS=("Check Pod Utilization" "Check Resource Limit" "Check Quota" "Check Node Utilization")
 PRACTICE_KEYS=("Check Probe" "Check Image Tag" "Check Route TLS")
 
@@ -207,7 +205,6 @@ T_POD = float(E.get('POD_THRESHOLD', 85))
 T_LOW = float(E.get('LOW_USAGE', 10))
 T_QUOTA = float(E.get('QUOTA_THRESHOLD', 85))
 T_RST = int(E.get('RESTART_THRESHOLD', 5))
-T_HK = int(E.get('HOUSEKEEP_THRESHOLD', 50))
 T_MAXPODS = int(E.get('MAX_PODS_WARN', 2000))
 T_PVC = float(E.get('PVC_THRESHOLD', 85))
 APPS_DOMAIN = E.get('APPS_DOMAIN', '')
@@ -663,7 +660,7 @@ for p in PODS:
         if p['active']: PVC_USERS[(p['ns'], c)].add(p['wl'][2] if p['wl'] else p['name'])
         else: PVC_DONE[(p['ns'], c)] += 1
 
-PVC_ROWS = []; PVC_CNT = Counter(); PVC_SIZE = defaultdict(float); PVC_USEDNS = defaultdict(float); pvc_bad = []; pvc_unused = 0; pvc_high = []
+PVC_ROWS = []; PVC_CNT = Counter(); PVC_SIZE = defaultdict(float); PVC_USEDNS = defaultdict(float); PVC_HASM = set(); pvc_metric = 0; pvc_bad = []; pvc_unused = 0; pvc_high = []
 for c in load('persistentvolumeclaims'):
     if not isapp(c): continue
     ns, name = c['metadata']['namespace'], c['metadata']['name']
@@ -685,10 +682,12 @@ for c in load('persistentvolumeclaims'):
     growth = (used - used7) / 7 if used is not None and used7 is not None else None
     full = '-'
     if growth is not None and growth > 0 and cap and used is not None:
-        full = '%d hari' % ((cap - used) / growth)
+        dleft = (cap - used) / growth
+        full = '> 1 tahun' if dleft > 365 else '%d hari' % dleft
     elif growth is not None:
         full = 'tidak naik'
-    if used is not None: PVC_USEDNS[ns] += used
+    if used is not None:
+        PVC_USEDNS[ns] += used; PVC_HASM.add(ns); pvc_metric += 1
     if up is not None and up > T_PVC:
         pvc_high.append('%s/%s(%s)' % (ns, name, fp(up)))
         tag = 'HIGH_USAGE' if tag == 'OK' else tag + ',HIGH_USAGE'
@@ -747,24 +746,6 @@ if rows:
 table('namespace', ['NAMESPACE', 'PODS', 'RUNNING', 'COMPLETED', 'NOT_OK', 'DEPLOY', 'STS', 'DS', 'DC', 'CRONJOB', 'OTHER',
                     'HPA', 'ROUTE', 'PVC', 'QUOTA', 'LIMITRANGE', 'REQUESTER', 'CREATED', 'DESCRIPTION'], rows)
 
-rows = []; hk_warn = []
-for ns in sorted(APP):
-    done = [p for p in PODS_NS[ns] if not p['active']]
-    if not done: continue
-    c = Counter('EVICTED' if 'EVICTED' in p['tags'] else p['phase'] for p in done)
-    ages = [p['age'] for p in done if p['age'] is not None]
-    tag = 'OK'
-    if len(done) > T_HK:
-        tag = 'CLEANUP'; hk_warn.append('%s(%d pod)' % (ns, len(done)))
-    rows.append([ns, c['Succeeded'], c['Failed'], c['EVICTED'], len(done),
-                 '%d hari' % max(ages) if ages else '-', tag])
-table('housekeeping', ['NAMESPACE', 'COMPLETED', 'FAILED', 'EVICTED', 'TOTAL', 'TERTUA', 'RESULT'], rows)
-if not APP:
-    result('Check Housekeeping', 'SKIP', 'Tidak ada namespace aplikasi')
-elif hk_warn:
-    result('Check Housekeeping', 'WARN', 'Pod selesai > %d per namespace: %s' % (T_HK, lst(hk_warn, 3)))
-else:
-    result('Check Housekeeping', 'PASS', '%d pod Completed/Failed, di bawah %d per namespace' % (sum(r[4] for r in rows), T_HK))
 
 # ============================================================
 # 2. WORKLOAD & PERUNTUKKAN
@@ -869,7 +850,7 @@ for ns in sorted(APP):
     for k, x in v.items(): TT[k] += x or 0
     rows.append([ns, len(act), fc(v['cr']), fc(v['cl']), fc(v['cu']), fp(pct(v['cu'], v['cr'])),
                  fm(v['mr']), fm(v['ml']), fm(v['mu']), fp(pct(v['mu'], v['mr'])), fm(PVC_SIZE[ns]) if PVC_CNT[ns] else '-',
-                 fm(PVC_USEDNS[ns]) if PVC_CNT[ns] and HAS_PVC_METRIC else '-'])
+                 fm(PVC_USEDNS[ns]) if ns in PVC_HASM else '-'])
 if rows:
     rows.append(['TOTAL', sum(r[1] for r in rows), fc(TT['cr']), fc(TT['cl']), fc(TT['cu']), fp(pct(TT['cu'], TT['cr'])),
                  fm(TT['mr']), fm(TT['ml']), fm(TT['mu']), fp(pct(TT['mu'], TT['mr'])), fm(sum(PVC_SIZE.values())),
@@ -1006,7 +987,7 @@ elif pvc_bad or pvc_high:
 elif not HAS_PVC_METRIC and PVC_ROWS:
     result('Check PVC', 'WARN', '%d PVC Bound' % len(PVC_ROWS) + nometric)
 else:
-    result('Check PVC', 'PASS', '%d PVC Bound, usage < %d%%' % (len(PVC_ROWS), T_PVC) + (', %d tidak dipakai pod manapun (info)' % pvc_unused if pvc_unused else ''))
+    result('Check PVC', 'PASS', '%d PVC Bound, usage < %d%% (data usage tersedia %d PVC, sisanya tidak di-mount pod aktif)' % (len(PVC_ROWS), T_PVC, pvc_metric) + (', %d tidak dipakai pod manapun (info)' % pvc_unused if pvc_unused else ''))
 
 # ============================================================
 # 8. UTILISASI NODE
@@ -1039,7 +1020,7 @@ for name in sorted(NODES):
     t += info
     rows.append([short(name), n['roles'], n['status'], fc(n['cpu']), fc(n['use_cpu']), fp(cu_p), fp(cr_p), fp(pct(n['cl'], n['cpu'])),
                  fm(n['mem']), fm(n['use_mem']), fp(mu_p), fp(mr_p), fp(pct(n['ml'], n['mem'])),
-                 '%d/%s' % (n['pods'], n['podcap'] or '-'), ','.join(t) or 'OK'])
+                 n['pods'], ','.join(t) or 'OK'])
     g = ROLE[n['roles']]
     g['n'] += 1
     for k in ('cpu', 'mem', 'cr', 'mr', 'app_cr', 'app_mr'): g[k] += n[k] or 0
@@ -1089,7 +1070,7 @@ with open(os.path.join(D, 'results.tsv'), 'w') as f:
         f.write('%s\t%s\t%s\n' % (k, s, d))
 PYEOF
 
-export PLATFORM_NS_REGEX INCLUDE_NS_REGEX RES_THRESHOLD POD_THRESHOLD LOW_USAGE QUOTA_THRESHOLD RESTART_THRESHOLD HOUSEKEEP_THRESHOLD MAX_PODS_WARN PVC_THRESHOLD APPS_DOMAIN
+export PLATFORM_NS_REGEX INCLUDE_NS_REGEX RES_THRESHOLD POD_THRESHOLD LOW_USAGE QUOTA_THRESHOLD RESTART_THRESHOLD MAX_PODS_WARN PVC_THRESHOLD APPS_DOMAIN
 if ! "$PY" "$TMP/analyze.py" "$TMP" "$CSV_DIR"; then
   echo -e "${RED}Analisa data gagal, cek error python di atas.${NC}"
   exit 1
@@ -1104,8 +1085,6 @@ section "1. INVENTORY NAMESPACE APLIKASI (jumlah pod & workload)"
 echo "NOT_OK = pod aktif yang belum Running/Ready, OTHER = owner lain (Job, operator CR, VM, dll)"
 echo
 show namespace "Tidak ada namespace aplikasi (cek PLATFORM_NS_REGEX / INCLUDE_NS_REGEX)"
-sub "Housekeeping pod Completed/Failed/Evicted (threshold ${HOUSEKEEP_THRESHOLD} per namespace)"
-show housekeeping "Tidak ada"
 
 ############################ 2. WORKLOAD ############################
 section "2. WORKLOAD & PERUNTUKKAN"
